@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>00 環境構築 — Oracle 実行計画の読み方</title>
+<meta name="description" content="Docker で Oracle AI Database 26ai Free を起動し、学習用のスキーマを作る。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/theme.js"></script>
+</head>
+<body data-root="../" data-page="chapters/00-setup.html">
+<header class="site-header">
+  <a class="brand" href="../index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Chapter 00</p>
+    <h1>環境構築</h1>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<div class="page-body">
+  <aside class="page-toc" aria-label="このページの目次"><p class="toc-title">目次</p><ul><li><a href="#_1">前提</a></li><li><a href="#_2">起動</a></li><li><a href="#_3">権限の付与とスキーマ作成</a></li><li><a href="#_4">接続</a></li><li><a href="#_5">スキーマ</a></li><li><a href="#_6">片付け</a></li></ul></aside>
+  <main class="content">
+<article>
+<p>Docker で Oracle AI Database 26ai Free を起動し、学習用のスキーマを作る。</p>
+<h2 id="_1">前提</h2>
+<ul>
+<li>Docker（Docker Desktop / Rancher Desktop など）</li>
+<li>Docker の VM に 6GB 以上のメモリを割り当てる。4GB では初期化中にスワップが続き、起動が終わらないことがある。Rancher Desktop で Kubernetes を使わない場合は無効にしておく</li>
+</ul>
+<h2 id="_2">起動</h2>
+<pre><code class="language-sh">docker compose up -d
+docker compose ps   # STATUS が healthy になるまで待つ（初回は数分かかる）
+</code></pre>
+<p>イメージは <a href="https://hub.docker.com/r/gvenzl/oracle-free">gvenzl/oracle-free</a> を使う。起動時にプラガブルデータベース <code>FREEPDB1</code> と学習用ユーザー <code>study</code> が作られる。</p>
+<h2 id="_3">権限の付与とスキーマ作成</h2>
+<pre><code class="language-sh"># DISPLAY_CURSOR に必要な権限を与える
+docker compose exec oracle sqlplus -s system/oracle@FREEPDB1 @/sql/00_grant.sql
+
+# 表とデータを作り、統計を取る
+docker compose exec oracle sqlplus -s study/study@FREEPDB1 @/sql/01_schema.sql
+</code></pre>
+<p>最後に表ごとの件数が表示されれば完了である。</p>
+<h2 id="_4">接続</h2>
+<pre><code class="language-sh">docker compose exec oracle sqlplus study/study@FREEPDB1
+</code></pre>
+<p>ホストの SQL Developer や DBeaver からは <code>localhost:1521/FREEPDB1</code> に接続する。</p>
+<h2 id="_5">スキーマ</h2>
+<table>
+<thead>
+<tr>
+<th>表</th>
+<th>件数</th>
+<th>特徴</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>customers</code></td>
+<td>10,000</td>
+<td><code>region</code> は 5 種類で均等</td>
+</tr>
+<tr>
+<td><code>products</code></td>
+<td>1,000</td>
+<td><code>category</code> は 20 種類</td>
+</tr>
+<tr>
+<td><code>orders</code></td>
+<td>200,000</td>
+<td><code>status</code> が偏っている（SHIPPED 約 98%）</td>
+</tr>
+<tr>
+<td><code>order_items</code></td>
+<td>約 400,000</td>
+<td>受注 1 件につき 1〜3 行</td>
+</tr>
+</tbody>
+</table>
+<p><code>orders.status</code> の偏りは、6 章で見積り誤差とヒストグラムを扱うときに使う。</p>
+<h2 id="_6">片付け</h2>
+<pre><code class="language-sh">docker compose down        # 停止（データは残る）
+docker compose down -v     # データも削除する
+</code></pre>
+</article>
+  </main>
+</div>
+
+<nav class="pager" aria-label="ほかの章へ"></nav>
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

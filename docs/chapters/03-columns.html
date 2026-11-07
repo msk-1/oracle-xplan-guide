@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 列の意味 — Oracle 実行計画の読み方</title>
+<meta name="description" content="DISPLAY_CURSOR(..., &#x27;ALLSTATS LAST&#x27;) の実績列を読む。要点は 2 つある。E-Rows は 1 回あたりの値であること、そして Buffers と A-Time は子の分を含む累計であることだ。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/theme.js"></script>
+</head>
+<body data-root="../" data-page="chapters/03-columns.html">
+<header class="site-header">
+  <a class="brand" href="../index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Chapter 03</p>
+    <h1>列の意味</h1>
+    <p class="sub">Starts / E-Rows / A-Rows / Buffers / A-Time</p>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<div class="page-body">
+  <aside class="page-toc" aria-label="このページの目次"><p class="toc-title">目次</p><ul><li><a href="#sql">題材の SQL</a></li><li><a href="#starts">Starts — その操作を実行した回数</a></li><li><a href="#e-rows-a-rows-1">E-Rows と A-Rows — 1 回あたりと合計</a><ul><li><a href="#3">小さな例: 顧客 3 人</a></li><li><a href="#2000">2000 人の例</a></li></ul></li><li><a href="#a-rows">A-Rows を読み違える場合</a><ul><li><a href="#1">1. 行を最後まで取り出さなかった</a></li><li><a href="#2-a-rows">2. A-Rows は全実行の合計である</a></li><li><a href="#3-allstats-last-1">3. 'ALLSTATS LAST' は最後の 1 回だけ</a></li><li><a href="#4-a-time">4. A-Time には誤差がある</a></li></ul></li><li><a href="#buffers">Buffers — 子の分を含む累計</a><ul><li><a href="#_1">どこで読んでいるか</a></li></ul></li><li><a href="#a-time">A-Time — これも累計で、誤差がある</a></li><li><a href="#_2">ヒントなしの計画と比べる</a></li><li><a href="#cost">Cost — オプティマイザの見積りコスト</a><ul><li><a href="#cost_1">Cost の意味</a></li><li><a href="#cost_2">Cost も累計である</a></li><li><a href="#cost_3">Cost を見るときの注意</a></li></ul></li><li><a href="#omem-1mem-used-mem">OMem / 1Mem / Used-Mem — 作業用メモリ</a></li><li><a href="#_3">まとめ</a></li></ul></aside>
+  <main class="content">
+<article>
+<p><code>DISPLAY_CURSOR(..., 'ALLSTATS LAST')</code> の実績列を読む。要点は 2 つある。<strong>E-Rows は 1 回あたりの値</strong>であること、そして <strong>Buffers と A-Time は子の分を含む累計</strong>であることだ。</p>
+<h2 id="sql">題材の SQL</h2>
+<p>関西の顧客の受注について、明細の行数を数える。内側が何度も実行される様子を見るため、ヒントで結合方式を NESTED LOOPS に固定している。スクリプトは <code>sql/ch03_columns.sql</code> にある。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS LEADING(c o i) USE_NL(o) USE_NL(i) */
+       COUNT(*) AS item_cnt
+FROM   customers c
+JOIN   orders o       ON o.customer_id = c.customer_id
+JOIN   order_items i  ON i.order_id    = o.order_id
+WHERE  c.region = 'KANSAI';
+</code></pre>
+<pre><code class="language-text">Plan hash value: 511572759
+
+-----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                              | Name               | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                       |                    |      1 |        |      1 |00:00:00.39 |    122K |
+|   1 |  SORT AGGREGATE                        |                    |      1 |      1 |      1 |00:00:00.39 |    122K |
+|   2 |   NESTED LOOPS                         |                    |      1 |  79221 |  80001 |00:00:00.38 |    122K |
+|   3 |    NESTED LOOPS                        |                    |      1 |  40000 |  40000 |00:00:00.39 |   42473 |
+|*  4 |     TABLE ACCESS FULL                  | CUSTOMERS          |      1 |   2000 |   2000 |00:00:00.01 |      60 |
+|   5 |     TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS             |   2000 |     20 |  40000 |00:00:00.16 |   42413 |
+|*  6 |      INDEX RANGE SCAN                  | ORDERS_CUSTOMER_IX |   2000 |     20 |  40000 |00:00:00.11 |    2413 |
+|*  7 |    INDEX RANGE SCAN                    | ORDER_ITEMS_PK     |  40000 |      2 |  80001 |00:00:00.19 |   80235 |
+-----------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter(&quot;C&quot;.&quot;REGION&quot;='KANSAI')
+   6 - access(&quot;O&quot;.&quot;CUSTOMER_ID&quot;=&quot;C&quot;.&quot;CUSTOMER_ID&quot;)
+   7 - access(&quot;I&quot;.&quot;ORDER_ID&quot;=&quot;O&quot;.&quot;ORDER_ID&quot;)
+</code></pre>
+<h2 id="starts">Starts — その操作を実行した回数</h2>
+<p>NESTED LOOPS は、外側（第 1 子）の <strong>1 行ごとに</strong>内側（第 2 子）を 1 回実行する。そのため、内側の <code>Starts</code> は外側の行数と同じになる。</p>
+<table>
+<thead>
+<tr>
+<th>内側の操作</th>
+<th>Starts</th>
+<th>外側の行数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Id 5・6（ORDERS を顧客ごとに引く）</td>
+<td>2,000</td>
+<td>Id 4 の A-Rows = 2,000（関西の顧客）</td>
+</tr>
+<tr>
+<td>Id 7（明細を受注ごとに引く）</td>
+<td>40,000</td>
+<td>Id 3 の A-Rows = 40,000（その受注）</td>
+</tr>
+</tbody>
+</table>
+<p><code>Starts</code> が大きい行は、1 回あたりの処理が軽くても合計で重くなりやすい。</p>
+<h2 id="e-rows-a-rows-1">E-Rows と A-Rows — 1 回あたりと合計</h2>
+<h3 id="3">小さな例: 顧客 3 人</h3>
+<p>まず顧客を 3 人に絞り、同じ形の計画を見る。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS LEADING(c o) USE_NL(o) INDEX(o orders_customer_ix) FULL(c) */
+       MAX(c.name), COUNT(o.amount)
+FROM   customers c
+JOIN   orders o ON o.customer_id = c.customer_id
+WHERE  c.customer_id IN (1, 6, 11);
+</code></pre>
+<pre><code class="language-text">---------------------------------------------------------------------------------------------
+| Id  | Operation           | Name               | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                    |      1 |        |      1 |00:00:00.01 |      65 |
+|   1 |  SORT AGGREGATE     |                    |      1 |      1 |      1 |00:00:00.01 |      65 |
+|   2 |   NESTED LOOPS      |                    |      1 |     60 |     60 |00:00:00.01 |      65 |
+|*  3 |    TABLE ACCESS FULL| CUSTOMERS          |      1 |      3 |      3 |00:00:00.01 |      60 |
+|*  4 |    INDEX RANGE SCAN | ORDERS_CUSTOMER_IX |      3 |     20 |     60 |00:00:00.01 |       5 |
+---------------------------------------------------------------------------------------------
+</code></pre>
+<p>Id 4 は 1 回だけ動くのではない。上から顧客が 1 人来るたびに 1 回動くので、3 回動いている。</p>
+<table>
+<thead>
+<tr>
+<th>回</th>
+<th>上から来た顧客</th>
+<th>見積り（1 回あたり）</th>
+<th>実際</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 回目</td>
+<td>顧客 1</td>
+<td>20</td>
+<td>20</td>
+</tr>
+<tr>
+<td>2 回目</td>
+<td>顧客 6</td>
+<td>20</td>
+<td>20</td>
+</tr>
+<tr>
+<td>3 回目</td>
+<td>顧客 11</td>
+<td>20</td>
+<td>20</td>
+</tr>
+<tr>
+<td>計画の表示</td>
+<td><code>Starts</code> = 3</td>
+<td><code>E-Rows</code> = 20</td>
+<td><code>A-Rows</code> = 60</td>
+</tr>
+</tbody>
+</table>
+<p>計画の 1 行は、複数回の実行をまとめて表示している。<strong><code>E-Rows</code> は 1 回分、<code>A-Rows</code> は合計</strong>である。件数が 20 から 60 に増えたのではなく、1 回分の数字と 3 回分の合計が同じ行に並んでいるだけである。</p>
+<div class="admonition note">
+<p class="admonition-title">c.name を SELECT する理由</p>
+<p><code>c.name</code> を SELECT しないと、customers の列を使わないため結合除去が起き、別の形の計画になる（<a href="02-reading-order.html">2 章</a>を参照）。</p>
+</div>
+<h3 id="2000">2000 人の例</h3>
+<p>2 つの列は単位が違う。</p>
+<ul>
+<li><code>E-Rows</code>：<strong>1 回の実行あたり</strong>の見積り行数</li>
+<li><code>A-Rows</code>：<strong>全実行の合計</strong>の実績行数</li>
+</ul>
+<p>そのため、見積りが正しかったかどうかは <strong><code>E-Rows × Starts</code> と <code>A-Rows</code> を比べて</strong>判断する。</p>
+<table>
+<thead>
+<tr>
+<th>Id</th>
+<th>E-Rows</th>
+<th>Starts</th>
+<th>E-Rows × Starts</th>
+<th>A-Rows</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>2,000</td>
+<td>1</td>
+<td>2,000</td>
+<td>2,000</td>
+<td>正確</td>
+</tr>
+<tr>
+<td>5</td>
+<td>20</td>
+<td>2,000</td>
+<td>40,000</td>
+<td>40,000</td>
+<td>正確</td>
+</tr>
+<tr>
+<td>7</td>
+<td>2</td>
+<td>40,000</td>
+<td>80,000</td>
+<td>80,001</td>
+<td>ほぼ正確</td>
+</tr>
+</tbody>
+</table>
+<p>Id 5 の <code>E-Rows</code> 20 と <code>A-Rows</code> 40,000 だけを並べると、見積りが 2,000 倍外れたように見える。しかし実際は、見積りは正確である。</p>
+<div class="admonition note">
+<p class="admonition-title">1 章の補足</p>
+<p>1 章では「E-Rows と A-Rows が大きくずれている行を探す」と書いた。<code>Starts</code> が 1 の行はそのまま比べてよい。
+<code>Starts</code> が 2 以上の行では、<strong>E-Rows に Starts を掛けてから</strong>比べる。</p>
+</div>
+<h2 id="a-rows">A-Rows を読み違える場合</h2>
+<p>A-Rows は実際に数えた値なので、数え間違いはない。ただし「何を数えた値か」を取り違えると読み間違える。</p>
+<h3 id="1">1. 行を最後まで取り出さなかった</h3>
+<p>SQL Developer などの画面ツールは、最初の数十行だけを取り出して表示することが多い。このとき、A-Rows は取り出した分だけになる。</p>
+<p>次は、受注と顧客を結合する SQL を実行し、最初の 50 行だけを取り出して閉じたときの計画である（<code>sql/ch03_columns.sql</code> の後半）。</p>
+<pre><code class="language-text">SQL_ID  ccmwp2ub9nuk4, child number 0
+
+---------------------------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name      | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+---------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |      1 |        |     50 |00:00:00.01 |     112 |       |       |          |
+|*  1 |  HASH JOIN         |           |      1 |    200K|     50 |00:00:00.01 |     112 |  1810K|  1810K| 2555K (0)|
+|   2 |   TABLE ACCESS FULL| CUSTOMERS |      1 |  10000 |  10000 |00:00:00.01 |      60 |       |       |          |
+|   3 |   TABLE ACCESS FULL| ORDERS    |      1 |    200K|     50 |00:00:00.01 |      52 |       |       |          |
+---------------------------------------------------------------------------------------------------------------------
+</code></pre>
+<p>ORDERS の E-Rows は 200K だが、A-Rows は 50 しかない。見積りが外れたのではない。50 行を返したところで取り出しが止まり、ORDERS もそこで読むのをやめただけである。</p>
+<p>調査では、SQL*Plus などで全件を取り出してから計画を表示する。または、<code>SELECT COUNT(*) FROM (...)</code> のように件数を数える SQL に包んで実行する。</p>
+<div class="admonition note">
+<p class="admonition-title">部分的に読んだ表と、全部読んだ表</p>
+<p>HASH JOIN の第 1 子（CUSTOMERS）は、ハッシュ表を作るために最初に全件を読む。そのため 10000 行のままである。
+途中で止まったのは、第 2 子（ORDERS）の読み込みだけである。</p>
+</div>
+<h3 id="2-a-rows">2. A-Rows は全実行の合計である</h3>
+<p>前の節のとおり、A-Rows は Starts 回分の合計である。E-Rows と直接比べず、<strong>E-Rows × Starts</strong> と比べる。</p>
+<h3 id="3-allstats-last-1">3. 'ALLSTATS LAST' は最後の 1 回だけ</h3>
+<p><code>'ALLSTATS LAST'</code> は、最後に実行した 1 回分の実績を表示する。バインド変数の値が変われば、A-Rows も変わる。別の値で遅くなっている場合は、その値で実行してから表示する。</p>
+<p><code>LAST</code> を付けずに <code>'ALLSTATS'</code> と指定すると、そのカーソルのこれまでの全実行の累計を表示する。</p>
+<h3 id="4-a-time">4. A-Time には誤差がある</h3>
+<p><code>GATHER_PLAN_STATISTICS</code> で実績を集めると、計測そのものに負荷がかかる。行数の多い操作ほど、A-Time が実際より長く出やすい。値の丸めもある。行数ではなく時間で比べるときは、この誤差に注意する。</p>
+<h2 id="buffers">Buffers — 子の分を含む累計</h2>
+<p><code>Buffers</code> は読んだブロックの数（論理読み込み）である。この値は<strong>子の操作の分を含む累計</strong>になっている。操作そのものが読んだ量は、次の式で求める。</p>
+<pre><code class="language-text">自分の分 = 自分の Buffers − 子の Buffers の合計
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Id</th>
+<th>操作</th>
+<th>Buffers（累計）</th>
+<th>子の合計</th>
+<th>自分の分</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7</td>
+<td>INDEX RANGE SCAN ORDER_ITEMS_PK</td>
+<td>80,235</td>
+<td>—（子なし）</td>
+<td><strong>80,235</strong></td>
+</tr>
+<tr>
+<td>6</td>
+<td>INDEX RANGE SCAN ORDERS_CUSTOMER_IX</td>
+<td>2,413</td>
+<td>—（子なし）</td>
+<td>2,413</td>
+</tr>
+<tr>
+<td>5</td>
+<td>TABLE ACCESS BY INDEX ROWID BATCHED ORDERS</td>
+<td>42,413</td>
+<td>2,413（Id 6）</td>
+<td><strong>40,000</strong></td>
+</tr>
+<tr>
+<td>4</td>
+<td>TABLE ACCESS FULL CUSTOMERS</td>
+<td>60</td>
+<td>—（子なし）</td>
+<td>60</td>
+</tr>
+<tr>
+<td>3</td>
+<td>NESTED LOOPS</td>
+<td>42,473</td>
+<td>60 + 42,413 = 42,473</td>
+<td>0</td>
+</tr>
+<tr>
+<td>2</td>
+<td>NESTED LOOPS</td>
+<td>122K</td>
+<td>42,473 + 80,235 = 122,708</td>
+<td>≒ 0</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition warning">
+<p class="admonition-title">K 表記は丸められている</p>
+<p>大きな値は <code>122K</code> のように丸めて表示される。Id 2 は 122,708 前後と考えられるが、正確な値は分からない。
+自分の分を引き算で求めるときは、誤差が出ることを前提にする。</p>
+</div>
+<h3 id="_1">どこで読んでいるか</h3>
+<p>自分の分が最も大きいのは <strong>Id 7（80,235）</strong>である。1 回あたりでは 80,235 ÷ 40,000 ≒ 2 ブロックしか読んでいない。それでも 4 万回実行しているので、積み上がって最大になった。</p>
+<p>次に大きいのは <strong>Id 5（40,000）</strong>で、受注 1 行あたり約 1 ブロックを読んでいる。1 人の顧客の受注は表の中のあちこちに散らばっている。そのため、1 行を取るたびに別のブロックを読むことになる。</p>
+<p>NESTED LOOPS の行（Id 2・3）は、子から受け取った行を組み合わせるだけで、自分ではブロックを読まない。</p>
+<h2 id="a-time">A-Time — これも累計で、誤差がある</h2>
+<p><code>A-Time</code> も子の分を含む累計である。ただし計測は丸められており、誤差も含む。この計画でも、Id 3 の 0.39 秒が親の Id 2 の 0.38 秒を上回っている。累計として考えればありえない値である。</p>
+<p>時間は計測のぶれも受けやすい。どの操作が重いかを比べるときは、時間より <strong>Buffers</strong> を使うほうが確実である。</p>
+<h2 id="_2">ヒントなしの計画と比べる</h2>
+<p>同じ SQL をヒントなしで実行すると、オプティマイザは HASH JOIN を選ぶ。</p>
+<pre><code class="language-text">Plan hash value: 2290686206
+
+-------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |             |      1 |        |      1 |00:00:00.19 |    2194 |       |       |          |
+|   1 |  SORT AGGREGATE      |             |      1 |      1 |      1 |00:00:00.19 |    2194 |       |       |          |
+|*  2 |   HASH JOIN          |             |      1 |  79221 |  80001 |00:00:00.10 |    2194 |  3800K|  3201K| 2894K (0)|
+|*  3 |    HASH JOIN         |             |      1 |  40000 |  40000 |00:00:00.03 |    1064 |  2278K|  2278K| 2735K (0)|
+|*  4 |     TABLE ACCESS FULL| CUSTOMERS   |      1 |   2000 |   2000 |00:00:00.01 |      60 |       |       |          |
+|   5 |     TABLE ACCESS FULL| ORDERS      |      1 |   200K |   200K |00:00:00.01 |    1004 |       |       |          |
+|   6 |    TABLE ACCESS FULL | ORDER_ITEMS |      1 |   400K |   400K |00:00:00.04 |    1130 |       |       |          |
+-------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>NESTED LOOPS 版</th>
+<th>HASH JOIN 版</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Buffers</td>
+<td>122K</td>
+<td>2,194</td>
+</tr>
+<tr>
+<td>全行の Starts</td>
+<td>最大 40,000</td>
+<td>すべて 1</td>
+</tr>
+</tbody>
+</table>
+<p>HASH JOIN 版は、ORDERS（20 万行）と ORDER_ITEMS（40 万行）を全件 FULL で読んでいる。それでも、読んだブロック数は NESTED LOOPS 版の約 1/56 である。</p>
+<p>FULL SCAN は、表のブロックを先頭から 1 回ずつ読むだけで済む。それに対して索引を何万回も引くと、同じブロックを何度も読むことになる。そのため、全件を読むほうが軽いことがある。</p>
+<p>「索引を使えば速い」とは限らない。結合方式をどう選ぶかは 5 章で扱う。</p>
+<h2 id="cost">Cost — オプティマイザの見積りコスト</h2>
+<p><code>ALLSTATS LAST</code> では表示されないが、<code>EXPLAIN PLAN</code> の出力には <code>Cost</code> 列がある。同じ 2 つの SQL を <code>EXPLAIN PLAN</code> にかけ、<code>DBMS_XPLAN.DISPLAY(NULL, NULL, 'BASIC +ROWS +COST')</code> で表示した。</p>
+<pre><code class="language-sql">EXPLAIN PLAN FOR
+SELECT /*+ LEADING(c o i) USE_NL(o) USE_NL(i) */ COUNT(*) ... ;   -- NESTED LOOPS 版
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, NULL, 'BASIC +ROWS +COST'));
+</code></pre>
+<p>NESTED LOOPS 版:</p>
+<pre><code class="language-text">| Id  | Operation                             | Name               | Rows  | Cost (%CPU)|
+|   0 | SELECT STATEMENT                      |                    |     1 |   122K  (1)|
+|   1 |  SORT AGGREGATE                       |                    |     1 |            |
+|   2 |   NESTED LOOPS                        |                    | 79221 |   122K  (1)|
+|   3 |    NESTED LOOPS                       |                    | 40000 | 42027   (1)|
+|   4 |     TABLE ACCESS FULL                 | CUSTOMERS          |  2000 |    20   (0)|
+|   5 |     TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS            |    20 |    21   (0)|
+|   6 |      INDEX RANGE SCAN                 | ORDERS_CUSTOMER_IX |    20 |     1   (0)|
+|   7 |    INDEX RANGE SCAN                   | ORDER_ITEMS_PK     |     2 |     2   (0)|
+</code></pre>
+<p>ヒントなし（HASH JOIN 版）:</p>
+<pre><code class="language-text">| Id  | Operation             | Name        | Rows  | Cost (%CPU)|
+|   0 | SELECT STATEMENT      |             |     1 |   987   (1)|
+|   1 |  SORT AGGREGATE       |             |     1 |            |
+|   2 |   HASH JOIN           |             | 79221 |   987   (1)|
+|   3 |    HASH JOIN          |             | 40000 |   293   (1)|
+|   4 |     TABLE ACCESS FULL | CUSTOMERS   |  2000 |    20   (0)|
+|   5 |     TABLE ACCESS FULL | ORDERS      |   200K|   273   (1)|
+|   6 |    TABLE ACCESS FULL  | ORDER_ITEMS |   400K|   308   (1)|
+</code></pre>
+<h3 id="cost_1">Cost の意味</h3>
+<ul>
+<li>Cost は、実行<strong>前</strong>に見積もった資源量である。おおむね「単一ブロック読み込み何回分か」という単位で表される。実測値ではない</li>
+<li>オプティマイザは、候補の計画のうち Cost が最小のものを選ぶ。ヒントなしで HASH JOIN 版（987）が選ばれたのは、NESTED LOOPS 版（122K）より小さいからである</li>
+</ul>
+<h3 id="cost_2">Cost も累計である</h3>
+<p>Cost も子の分を含む累計である。さらに NESTED LOOPS の内側の行（Id 5・7）では、<code>Rows</code> と同じく Cost も <strong>1 回あたり</strong>の値になる。親の Cost は、外側の行数を掛けて積み上がる。</p>
+<pre><code class="language-text">Id 3:  2000 回 × 21（Id 5 の 1 回あたり） ≒ 42027
+Id 2:  42027 + 40000 回 × 2（Id 7 の 1 回あたり） ≒ 122K
+</code></pre>
+<p>この 122K は、実測した <code>Buffers</code> の 122K とほぼ一致している。見積り行数が正確なので、コストの見積りも実態に近い。</p>
+<h3 id="cost_3">Cost を見るときの注意</h3>
+<ul>
+<li>別の SQL どうしで Cost を比べても意味がない。Cost は、同じ SQL の候補の計画を比べるための値である</li>
+<li>見積り行数が外れれば、Cost も外れる。1 章の例では E-Rows 66,667 に対して A-Rows は 3,000 だった。この場合、Cost はずれた行数をもとに計算されている</li>
+<li>そのため調査では、Cost ではなく <code>A-Rows</code> と <code>Buffers</code> を見る</li>
+</ul>
+<h2 id="omem-1mem-used-mem">OMem / 1Mem / Used-Mem — 作業用メモリ</h2>
+<p>ハッシュ表やソートが使ったメモリを表す列である。</p>
+<ul>
+<li><code>OMem</code>：すべてをメモリ内で処理するのに必要な量の見積り</li>
+<li><code>1Mem</code>：ディスクへの 1 回の書き出しで済ませる場合に必要な量の見積り</li>
+<li><code>Used-Mem</code>：実際に使った量</li>
+</ul>
+<p><code>Used-Mem</code> の後ろの括弧の数字は、ディスクに書き出した回数である。<code>(0)</code> なら、ディスクを使わずメモリだけで処理できている。</p>
+<h2 id="_3">まとめ</h2>
+<ul>
+<li><code>Starts</code> はその操作を実行した回数である。NESTED LOOPS の内側は、外側の行数と同じ回数だけ実行される</li>
+<li><code>E-Rows</code> は 1 回あたり、<code>A-Rows</code> は合計である。見積りの当否は <strong>E-Rows × Starts</strong> と A-Rows を比べて判断する</li>
+<li><code>Buffers</code> と <code>A-Time</code> は子の分を含む累計である。操作そのものの分は「自分 − 子の合計」で求める</li>
+<li>重い操作を探すときは、時間より Buffers を見る。1 回あたりは軽くても、Starts が大きいと積み上がる</li>
+<li>索引を何万回も引くより、FULL SCAN で全件を読むほうが軽いことがある</li>
+<li><code>Cost</code> は実行前の見積りで、オプティマイザが計画を選ぶための値である。調査では Cost より A-Rows と Buffers を見る</li>
+<li>A-Rows は実測だが、行を最後まで取り出さないと少なく出る。調査では全件を取り出してから計画を見る</li>
+</ul>
+</article>
+  </main>
+</div>
+
+<nav class="pager" aria-label="ほかの章へ"></nav>
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

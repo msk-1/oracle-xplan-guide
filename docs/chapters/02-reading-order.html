@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 読む順番 — Oracle 実行計画の読み方</title>
+<meta name="description" content="実行計画は Id の順に実行されるわけではない。インデントから親子関係を読み取り、「親は子を上から順に呼ぶ」という規則で処理をたどる。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/theme.js"></script>
+</head>
+<body data-root="../" data-page="chapters/02-reading-order.html">
+<header class="site-header">
+  <a class="brand" href="../index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Chapter 02</p>
+    <h1>読む順番</h1>
+    <p class="sub">Id・インデント・親子関係</p>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<div class="page-body">
+  <aside class="page-toc" aria-label="このページの目次"><p class="toc-title">目次</p><ul><li><a href="#sql">題材の SQL</a></li><li><a href="#_1">読む順番の規則</a><ul><li><a href="#_2">ツリーで描く</a></li><li><a href="#_3">実行の流れ</a></li></ul></li><li><a href="#nested-loops-1">NESTED LOOPS — 外側の 1 行ごとに内側を実行する</a><ul><li><a href="#2-nested-loops">2 段の NESTED LOOPS</a></li></ul></li><li><a href="#hash-join-1">HASH JOIN — 第 1 子でハッシュ表を作る</a></li><li><a href="#predicate-information-access-filter">Predicate Information — access と filter</a></li><li><a href="#customers">CUSTOMERS が計画にない — 結合除去</a><ul><li><a href="#_4">確かめる</a></li></ul></li><li><a href="#note-adaptive-plan">Note — adaptive plan</a></li><li><a href="#_5">まとめ</a></li></ul></aside>
+  <main class="content">
+<article>
+<p>実行計画は <strong>Id の順に実行されるわけではない</strong>。インデントから親子関係を読み取り、「親は子を上から順に呼ぶ」という規則で処理をたどる。</p>
+<h2 id="sql">題材の SQL</h2>
+<p>顧客 42 の受注について、明細と商品名を出す。スクリプトは <code>sql/ch02_reading_order.sql</code> にある。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS */
+       o.order_id, o.order_date, p.name AS product, i.quantity
+FROM   customers c
+JOIN   orders o       ON o.customer_id = c.customer_id
+JOIN   order_items i  ON i.order_id    = o.order_id
+JOIN   products p     ON p.product_id  = i.product_id
+WHERE  c.customer_id = 42
+ORDER  BY o.order_id, i.line_no;
+</code></pre>
+<pre><code class="language-sh">docker compose exec oracle sqlplus study/study@FREEPDB1 @/sql/ch02_reading_order.sql
+</code></pre>
+<pre><code class="language-text">Plan hash value: 2513613967
+
+---------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                               | Name               | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+---------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                        |                    |      1 |        |     39 |00:00:00.01 |     118 |       |       |          |
+|   1 |  SORT ORDER BY                          |                    |      1 |     40 |     39 |00:00:00.01 |     118 |  4096 |  4096 | 4096  (0)|
+|*  2 |   HASH JOIN                             |                    |      1 |     40 |     39 |00:00:00.01 |     118 |  1265K|  1265K|  724K (0)|
+|   3 |    NESTED LOOPS                         |                    |      1 |     40 |     39 |00:00:00.03 |     105 |       |       |          |
+|   4 |     NESTED LOOPS                        |                    |      1 |     40 |     39 |00:00:00.03 |      66 |       |       |          |
+|   5 |      TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS             |      1 |     20 |     20 |00:00:00.01 |      22 |       |       |          |
+|*  6 |       INDEX RANGE SCAN                  | ORDERS_CUSTOMER_IX |      1 |     20 |     20 |00:00:00.01 |       2 |       |       |          |
+|*  7 |      INDEX RANGE SCAN                   | ORDER_ITEMS_PK     |     20 |      2 |     39 |00:00:00.01 |      44 |       |       |          |
+|   8 |     TABLE ACCESS BY INDEX ROWID         | ORDER_ITEMS        |     39 |      2 |     39 |00:00:00.01 |      39 |       |       |          |
+|   9 |    TABLE ACCESS FULL                    | PRODUCTS           |      1 |   1000 |   1000 |00:00:00.01 |      13 |       |       |          |
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access(&quot;P&quot;.&quot;PRODUCT_ID&quot;=&quot;I&quot;.&quot;PRODUCT_ID&quot;)
+   6 - access(&quot;O&quot;.&quot;CUSTOMER_ID&quot;=42)
+   7 - access(&quot;I&quot;.&quot;ORDER_ID&quot;=&quot;O&quot;.&quot;ORDER_ID&quot;)
+
+Note
+-----
+   - this is an adaptive plan
+</code></pre>
+<h2 id="_1">読む順番の規則</h2>
+<ol>
+<li><strong>インデントで親子を決める。</strong> ある行の親は、それより上にあって、インデントが 1 段浅い最も近い行である</li>
+<li><strong>親は子を上から順に呼ぶ。</strong> 子が 2 つある結合では、上の子（第 1 子）を先に、下の子（第 2 子）を後に使う</li>
+<li><strong>行を最初に生み出すのは、第 1 子をたどり続けた先の葉</strong>である。葉とは、子を持たない行を指す</li>
+</ol>
+<p>Id は上から振られた単なる番号である。実行の順番は表していない。</p>
+<h3 id="_2">ツリーで描く</h3>
+<p>インデントを線に置き換えると、親子関係が見える。</p>
+<pre><code class="language-text">0 SELECT STATEMENT
+└─ 1 SORT ORDER BY
+   └─ 2 HASH JOIN
+      ├─ 3 NESTED LOOPS                         ← 第 1 子（ハッシュ表を作る側）
+      │  ├─ 4 NESTED LOOPS                      ← 第 1 子（外側）
+      │  │  ├─ 5 TABLE ACCESS BY INDEX ROWID BATCHED  ORDERS   ← 第 1 子（外側）
+      │  │  │  └─ 6 INDEX RANGE SCAN  ORDERS_CUSTOMER_IX
+      │  │  └─ 7 INDEX RANGE SCAN  ORDER_ITEMS_PK             ← 第 2 子（内側）
+      │  └─ 8 TABLE ACCESS BY INDEX ROWID  ORDER_ITEMS        ← 第 2 子（内側）
+      └─ 9 TABLE ACCESS FULL  PRODUCTS          ← 第 2 子（突き合わせる側）
+</code></pre>
+<h3 id="_3">実行の流れ</h3>
+<p>Id 0 から第 1 子をたどると、最初に行を生み出すのは Id 6 である。そこから親へ戻りながら処理が進む。</p>
+<table>
+<thead>
+<tr>
+<th>順</th>
+<th>Id</th>
+<th>処理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>6</td>
+<td>索引 <code>ORDERS_CUSTOMER_IX</code> で <code>customer_id = 42</code> の ROWID を探す</td>
+</tr>
+<tr>
+<td>2</td>
+<td>5</td>
+<td>その ROWID で ORDERS の行を読む（20 行）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>7</td>
+<td>受注 1 行ごとに、主キー索引で明細の ROWID を探す</td>
+</tr>
+<tr>
+<td>4</td>
+<td>4</td>
+<td>受注と明細の ROWID を組み合わせる</td>
+</tr>
+<tr>
+<td>5</td>
+<td>8</td>
+<td>明細の ROWID で ORDER_ITEMS の行を読む（39 行）</td>
+</tr>
+<tr>
+<td>6</td>
+<td>3</td>
+<td>受注と明細の結合結果を返す</td>
+</tr>
+<tr>
+<td>7</td>
+<td>9</td>
+<td>PRODUCTS を全件読む（1000 行）</td>
+</tr>
+<tr>
+<td>8</td>
+<td>2</td>
+<td>明細の product_id で商品を突き合わせる</td>
+</tr>
+<tr>
+<td>9</td>
+<td>1</td>
+<td>order_id, line_no で並べ替える</td>
+</tr>
+<tr>
+<td>10</td>
+<td>0</td>
+<td>結果 39 行を返す</td>
+</tr>
+</tbody>
+</table>
+<p>実行順は <strong>6 → 5 → 7 → 4 → 8 → 3 → 9 → 2 → 1 → 0</strong> となり、Id の順とは一致しない。</p>
+<div class="admonition note">
+<p class="admonition-title">「いちばん深い行から読む」は正確ではない</p>
+<p>よく「インデントが一番深い行から読む」と説明される。この計画ではたまたま当てはまるが、規則としては「第 1 子をたどった先の葉から」が正しい。
+たとえば Id 9 は浅い位置にあるが、Id 3 の処理がすべて終わるまで動かない。</p>
+</div>
+<h2 id="nested-loops-1">NESTED LOOPS — 外側の 1 行ごとに内側を実行する</h2>
+<p>NESTED LOOPS は、第 1 子（外側）が返す 1 行ごとに、第 2 子（内側）を 1 回実行する。<code>Starts</code> 列で確かめられる。</p>
+<table>
+<thead>
+<tr>
+<th>Id</th>
+<th>操作</th>
+<th>Starts</th>
+<th>E-Rows</th>
+<th>A-Rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5</td>
+<td>ORDERS（外側）</td>
+<td>1</td>
+<td>20</td>
+<td>20</td>
+</tr>
+<tr>
+<td>7</td>
+<td>ORDER_ITEMS_PK（内側）</td>
+<td><strong>20</strong></td>
+<td>2</td>
+<td>39</td>
+</tr>
+<tr>
+<td>8</td>
+<td>ORDER_ITEMS（内側）</td>
+<td><strong>39</strong></td>
+<td>2</td>
+<td>39</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>Id 7 は、外側の受注 20 行に対して 20 回実行された</li>
+<li><code>E-Rows</code> は <strong>1 回あたり</strong> の見積りである（受注 1 件につき明細 2 行）</li>
+<li><code>A-Rows</code> は <strong>全実行の合計</strong> である（20 回で 39 行）</li>
+</ul>
+<p>見積りと実績を比べるときは、<code>E-Rows × Starts</code> と <code>A-Rows</code> を比べる。ここでは 2 × 20 = 40 に対し 39 で、見積りはほぼ正しい。</p>
+<h3 id="2-nested-loops">2 段の NESTED LOOPS</h3>
+<p>Id 3 と Id 4 は、どちらも ORDERS と ORDER_ITEMS の結合である。索引を引く段（Id 4）と表を読む段（Id 3）に分かれている。</p>
+<ul>
+<li>Id 4: 受注 1 行ごとに、明細の<strong>ROWID だけ</strong>を索引から集める</li>
+<li>Id 3: 集めた ROWID 1 つごとに、ORDER_ITEMS の行を読む（Id 8 の Starts = 39）</li>
+</ul>
+<p>この形を NLJ batching という。表へのアクセスをまとめて行い、I/O を減らすための形である。読み方は通常の NESTED LOOPS と同じでよい。</p>
+<h2 id="hash-join-1">HASH JOIN — 第 1 子でハッシュ表を作る</h2>
+<p>HASH JOIN（Id 2）は子を 2 つ持ち、それぞれ 1 回ずつ実行する。</p>
+<ol>
+<li><strong>第 1 子（Id 3）</strong> の結果 39 行を読み、結合キー <code>product_id</code> でメモリ上にハッシュ表を作る。この側を build 入力と呼ぶ</li>
+<li><strong>第 2 子（Id 9）</strong> の PRODUCTS 1000 行を 1 行ずつ読み、ハッシュ表を引いて一致する行を返す。この側を probe 入力と呼ぶ</li>
+</ol>
+<p>ハッシュ表を作り終えるまで、HASH JOIN は 1 行も返さない。オプティマイザは通常、<strong>小さい方を第 1 子に置く</strong>。<code>Used-Mem</code> の 724K は、ハッシュ表に使ったメモリ量である。</p>
+<h2 id="predicate-information-access-filter">Predicate Information — access と filter</h2>
+<p><code>Id</code> に <code>*</code> が付いた行には条件があり、その中身が Predicate Information に表示される。</p>
+<table>
+<thead>
+<tr>
+<th>種類</th>
+<th>意味</th>
+<th>例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>access</code></td>
+<td>読む範囲を絞る条件。索引を引く、ハッシュ表を引くなどに使う</td>
+<td><code>6 - access("O"."CUSTOMER_ID"=42)</code></td>
+</tr>
+<tr>
+<td><code>filter</code></td>
+<td>読んだ行を捨てるかどうかの条件。読む量は減らない</td>
+<td>1 章の <code>4 - filter("O"."STATUS"='PENDING')</code></td>
+</tr>
+</tbody>
+</table>
+<p>Id 6 は <code>access</code> なので、索引の <code>customer_id = 42</code> の部分だけを読んでいる。<code>Buffers</code> が 2 と小さいのはそのためである。</p>
+<p>1 章の Id 4 は <code>filter</code> である。ORDERS を全件読み、PENDING 以外の行を捨てていた。<code>filter</code> の行で A-Rows が少なく Buffers が多い場合は、無駄に読んで捨てていることを意味する。</p>
+<h2 id="customers">CUSTOMERS が計画にない — 結合除去</h2>
+<p>SQL では CUSTOMERS を結合しているのに、計画に CUSTOMERS がない。これは結合除去（join elimination）による。オプティマイザは次の 3 点から、CUSTOMERS を結合しても結果が変わらないと判断した。</p>
+<ul>
+<li><code>orders.customer_id</code> は NOT NULL である</li>
+<li><code>orders.customer_id</code> は CUSTOMERS への外部キーなので、対応する顧客が必ず 1 行だけある</li>
+<li>CUSTOMERS の列を SELECT していない</li>
+</ul>
+<p>条件 <code>c.customer_id = 42</code> は、結合条件を通して <code>o.customer_id = 42</code> に置き換えられている（Id 6 の access）。</p>
+<h3 id="_4">確かめる</h3>
+<p>SELECT に <code>c.name</code> を加えると、CUSTOMERS の列が必要になるため、結合は除去されない。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS */
+       c.name AS customer, o.order_id, o.order_date, p.name AS product, i.quantity
+FROM   ...                                     -- 以降は同じ
+</code></pre>
+<pre><code class="language-text">Plan hash value: 4178956635
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                | Name               | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+----------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                         |                    |      1 |        |     39 |00:00:00.01 |     120 |       |       |          |
+|   1 |  SORT ORDER BY                           |                    |      1 |     40 |     39 |00:00:00.01 |     120 |  4096 |  4096 | 4096  (0)|
+|*  2 |   HASH JOIN                              |                    |      1 |     40 |     39 |00:00:00.01 |     120 |  1115K|  1115K|  724K (0)|
+|   3 |    NESTED LOOPS                          |                    |      1 |     40 |     39 |00:00:00.01 |     108 |       |       |          |
+|   4 |     NESTED LOOPS                         |                    |      1 |     40 |     39 |00:00:00.01 |      69 |       |       |          |
+|   5 |      NESTED LOOPS                        |                    |      1 |     20 |     20 |00:00:00.01 |      25 |       |       |          |
+|   6 |       TABLE ACCESS BY INDEX ROWID        | CUSTOMERS          |      1 |      1 |      1 |00:00:00.01 |       3 |       |       |          |
+|*  7 |        INDEX UNIQUE SCAN                 | SYS_C008720        |      1 |      1 |      1 |00:00:00.01 |       2 |       |       |          |
+|   8 |       TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS             |      1 |     20 |     20 |00:00:00.01 |      22 |       |       |          |
+|*  9 |        INDEX RANGE SCAN                  | ORDERS_CUSTOMER_IX |      1 |     20 |     20 |00:00:00.01 |       2 |       |       |          |
+|* 10 |      INDEX RANGE SCAN                    | ORDER_ITEMS_PK     |     20 |      2 |     39 |00:00:00.01 |      44 |       |       |          |
+|  11 |     TABLE ACCESS BY INDEX ROWID          | ORDER_ITEMS        |     39 |      2 |     39 |00:00:00.01 |      39 |       |       |          |
+|  12 |    TABLE ACCESS FULL                     | PRODUCTS           |      1 |   1000 |   1000 |00:00:00.01 |      12 |       |       |          |
+----------------------------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access(&quot;P&quot;.&quot;PRODUCT_ID&quot;=&quot;I&quot;.&quot;PRODUCT_ID&quot;)
+   7 - access(&quot;C&quot;.&quot;CUSTOMER_ID&quot;=42)
+   9 - access(&quot;O&quot;.&quot;CUSTOMER_ID&quot;=42)
+  10 - access(&quot;I&quot;.&quot;ORDER_ID&quot;=&quot;O&quot;.&quot;ORDER_ID&quot;)
+</code></pre>
+<p>Id 5〜7 に CUSTOMERS の結合が加わった。主キー索引 <code>SYS_C008720</code> を <code>INDEX UNIQUE SCAN</code> で 1 行引いている（索引名はシステムが付けるので環境によって異なる）。</p>
+<p>Id 9 には <code>access("O"."CUSTOMER_ID"=42)</code> が残っている。SQL には <code>o.customer_id = 42</code> と書いていないが、<code>c.customer_id = 42</code> と結合条件 <code>o.customer_id = c.customer_id</code> からオプティマイザが導いた条件である。これを推移的な述語生成と呼ぶ。この条件があるため、ORDERS も索引で絞り込める。</p>
+<h2 id="note-adaptive-plan">Note — adaptive plan</h2>
+<p><code>this is an adaptive plan</code> は、<strong>実行時に結合方式を切り替えられる計画</strong>であることを示す。オプティマイザは NESTED LOOPS と HASH JOIN の両方を用意しておき、実際に流れた行数を見て、どちらを使うかを決める。表示されているのは、実際に使われた方式である。詳しくは 5 章で扱う。</p>
+<h2 id="_5">まとめ</h2>
+<ul>
+<li>実行計画は Id の順に動くわけではない。インデントで親子を決め、<strong>親は子を上から順に呼ぶ</strong></li>
+<li>最初に動くのは、<strong>第 1 子をたどった先の葉</strong>である</li>
+<li>NESTED LOOPS の内側は外側の行数だけ実行される。<code>Starts</code> を見て、<code>E-Rows × Starts</code> と <code>A-Rows</code> を比べる</li>
+<li>HASH JOIN は第 1 子でハッシュ表を作り、第 2 子で突き合わせる</li>
+<li><code>access</code> は読む範囲を絞る条件、<code>filter</code> は読んだ後に捨てる条件である</li>
+<li>SQL に書いた表が計画にないときは、結合除去を疑う</li>
+</ul>
+</article>
+  </main>
+</div>
+
+<nav class="pager" aria-label="ほかの章へ"></nav>
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle 実行計画の読み方</title>
+<meta name="description" content="DBMS_XPLAN の出力を上から下まで読めるようになるための学習ノート。掲載する実行計画はすべて実測。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/theme.js"></script>
+</head>
+<body class="home" data-root="" data-page="index.html">
+<header class="site-header">
+  <a class="brand" href="index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero hero--top">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Oracle Execution Plan — Study Notes</p>
+    <h1>reading<br>execution plans</h1>
+    <p class="sub">Oracle の実行計画を、上から下まで自分の言葉で説明できるようになるための学習ノート。</p>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<main>
+  <section class="section" id="about">
+    <p class="lead"><code>DBMS_XPLAN</code> の出力を見たことはあるが、どこから読めばよいか、<code>Rows</code> や <code>Cost</code> が何を意味するかがあいまいな人に向けて書いている。掲載する実行計画は、すべて手元の Docker 環境で<strong>実際に取得したもの</strong>である。</p>
+    <ol class="goals">
+      <li><span class="n">GOAL 01</span>実行計画を<strong>正しい順番</strong>で読み、処理の流れを言葉で説明できる</li>
+      <li><span class="n">GOAL 02</span><strong>見積り（E-Rows）と実績（A-Rows）</strong>を比べ、遅さの原因がどの行にあるかを特定できる</li>
+      <li><span class="n">GOAL 03</span>アクセスパスと結合方式を見て、なぜオプティマイザがそれを選んだかを推測できる</li>
+    </ol>
+  </section>
+
+  <section class="section" id="chapters">
+    <div class="section-head">
+      <h2 class="section-title">chapters</h2>
+    </div>
+    <div class="grid" id="chapter-grid"></div>
+  </section>
+
+  <section class="section" id="policy">
+    <div class="section-head"><h2 class="section-title">policy</h2></div>
+    <ul class="policy">
+      <li>掲載する実行計画は、すべて <a href="chapters/00-setup.html">環境構築</a> の環境で実際に取得したものである。説明のための作例を載せる場合は、作例と明記する</li>
+      <li>対象バージョンは Oracle AI Database 26ai Free（23.26.3）。他のバージョンでは列や表示が異なる場合がある</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="assets/nav.js"></script>
+</body>
+</html>

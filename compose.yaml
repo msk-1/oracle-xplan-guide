@@ -1,0 +1,22 @@
+services:
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    container_name: oracle-xplan
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: oracle          # SYS / SYSTEM のパスワード（学習専用）
+      APP_USER: study                  # FREEPDB1 に作られる学習用ユーザー
+      APP_USER_PASSWORD: study
+    volumes:
+      - ./sql:/sql:ro
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  oracle-data:

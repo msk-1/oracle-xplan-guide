@@ -1,0 +1,839 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04-1 索引のしくみ — Oracle 実行計画の読み方</title>
+<meta name="description" content="実行計画の INDEX ... SCAN を読むには、索引の中で何が起きているかを知っておく必要がある。このページでは、単一列の索引の構造から始め、複合索引の列の順番が性能を左右する理由までを、図と実測で説明する。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/theme.js"></script>
+</head>
+<body data-root="../" data-page="chapters/04-index.html">
+<header class="site-header">
+  <a class="brand" href="../index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Chapter 04-1</p>
+    <h1>索引のしくみ</h1>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<div class="page-body">
+  <aside class="page-toc" aria-label="このページの目次"><p class="toc-title">目次</p><ul><li><a href="#1-rowid">1. 前提: ブロックと ROWID</a><ul><li><a href="#_1">ブロック</a></li><li><a href="#rowid">ROWID</a></li></ul></li><li><a href="#2-b-tree">2. 索引の構造 — B-tree</a><ul><li><a href="#rowid_1">索引は「値 → ROWID」の対応表</a></li><li><a href="#_2">木の形</a></li><li><a href="#_3">ルートブロックの中身</a></li><li><a href="#1-index-unique-scan">1 行を引く: INDEX UNIQUE SCAN の経路</a></li><li><a href="#index-range-scan">複数の行を引く: INDEX RANGE SCAN の経路</a></li></ul></li><li><a href="#3">3. 件数が増えても検索が遅くならない理由</a><ul><li><a href="#_4">段数の上限</a></li></ul></li><li><a href="#4">4. ブロックの中は並んでいるか</a><ul><li><a href="#insert">まとまり具合を決めるのは INSERT の順番</a></li></ul></li><li><a href="#5">5. 複合索引</a><ul><li><a href="#_5">複合索引の並び方</a></li><li><a href="#1">効果 1: 表を読む前に絞り込める</a></li><li><a href="#2">効果 2: 索引だけで答えを出す（カバリング）</a></li><li><a href="#1-range-scan">列の順番 1: 先頭列の条件がないと RANGE SCAN できない</a></li><li><a href="#2_1">列の順番 2: 等価条件の列を先、範囲条件の列を後</a></li></ul></li><li><a href="#6-range-scan">6. 索引があっても RANGE SCAN できない書き方</a><ul><li><a href="#_6">列に関数をかける（実測）</a></li><li><a href="#_7">そのほかの典型例（この環境では測っていない）</a></li></ul></li><li><a href="#7">7. 索引の代償</a></li><li><a href="#_8">まとめ</a></li></ul></aside>
+  <main class="content">
+<article>
+<p>実行計画の <code>INDEX ... SCAN</code> を読むには、索引の中で何が起きているかを知っておく必要がある。このページでは、単一列の索引の構造から始め、複合索引の列の順番が性能を左右する理由までを、図と実測で説明する。</p>
+<p>アクセスパスの種類ごとの読み方は <a href="04-access-paths.html">4-2. アクセスパス</a> で扱う。</p>
+<p>使う SQL は次の 2 つである。</p>
+<ul>
+<li><code>sql/ch04_access_paths.sql</code>: ブロック・ROWID・索引の統計を見る</li>
+<li><code>sql/ch04_composite_index.sql</code>: 複合索引を作って測り、最後に削除する</li>
+</ul>
+<pre><code class="language-sh">docker compose exec oracle sqlplus study/study@FREEPDB1 @/sql/ch04_composite_index.sql
+</code></pre>
+<h2 id="1-rowid">1. 前提: ブロックと ROWID</h2>
+<h3 id="_1">ブロック</h3>
+<p>Oracle は表のデータを<strong>ブロック</strong>という単位で保存し、ブロック単位で読み書きする。ORDERS は 1000 ブロックに 20 万行が入っており、1 ブロックあたり約 200 行である。</p>
+<p>計画の <code>Buffers</code> は読んだブロック数である。1 行だけ欲しくても、その行が入っているブロックを丸ごと 1 つ読む。</p>
+<pre><code class="language-text">    BLOCKS   NUM_ROWS
+---------- ----------
+      1000     200000
+</code></pre>
+<h3 id="rowid">ROWID</h3>
+<p><strong>ROWID</strong> は行の住所である。どのファイルの、どのブロックの、何番目の行かを表す。</p>
+<pre><code class="language-sql">SELECT order_id, rowid, DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid) AS block_no
+FROM   orders
+WHERE  order_id IN (12345, 12346);
+</code></pre>
+<pre><code class="language-text">  ORDER_ID ROWID                BLOCK_NO
+---------- ------------------ ----------
+     12345 AAAR6IAAYAAAADhACt        225
+     12346 AAAR6IAAYAAAADhACu        225
+</code></pre>
+<p>受注 12345 と 12346 は、どちらも 225 番のブロックに入っている。ROWID が分かれば、表のどこを読めばよいかが 1 回で決まる。</p>
+<h2 id="2-b-tree">2. 索引の構造 — B-tree</h2>
+<h3 id="rowid_1">索引は「値 → ROWID」の対応表</h3>
+<p><strong>索引</strong>は、列の値と ROWID の組を、値の順に並べて保存したものである。本の巻末索引と同じく、「order_id 12345 は 225 番ブロックにある」と引ける。</p>
+<p>索引の 1 項目（エントリ）は次の形をしている。</p>
+<table>
+<thead>
+<tr>
+<th>キー（列の値）</th>
+<th>ROWID（行の住所）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>12345</code></td>
+<td><code>AAAR6IAAYAAAADhACt</code></td>
+</tr>
+</tbody>
+</table>
+<p>索引には、索引に含めた列の値しか入っていない。それ以外の列（ORDERS なら <code>order_date</code> や <code>amount</code>）が必要なときは、ROWID を使って表を読みに行く。</p>
+<h3 id="_2">木の形</h3>
+<p>項目は<strong>葉ブロック</strong>に値の順で詰められる。葉を探すための目次が<strong>ルート</strong>と<strong>ブランチ</strong>である。葉どうしは左右の隣とつながっていて、値の順にたどれる。</p>
+<figure class="xp-figure">
+<svg viewBox="0 0 700 340" role="img" aria-label="B-tree 索引の構造。ルートから 2 つのブランチ、4 つの葉へ枝分かれし、葉どうしは左右につながる。葉の ROWID から表のブロックを読む">
+<defs>
+<marker id="t-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow"/></marker>
+</defs>
+<text x="8" y="20" class="xp-accent">索引</text>
+<rect x="300" y="10" width="100" height="46" rx="6" class="xp-box"/>
+<text x="350" y="30" text-anchor="middle" class="xp-text">ルート</text>
+<text x="350" y="47" text-anchor="middle" class="xp-small">どこへ進むか</text>
+<rect x="130" y="95" width="110" height="46" rx="6" class="xp-box"/>
+<text x="185" y="115" text-anchor="middle" class="xp-text">ブランチ</text>
+<text x="185" y="132" text-anchor="middle" class="xp-small">どの葉へ進むか</text>
+<rect x="460" y="95" width="110" height="46" rx="6" class="xp-box"/>
+<text x="515" y="115" text-anchor="middle" class="xp-text">ブランチ</text>
+<text x="515" y="132" text-anchor="middle" class="xp-small">どの葉へ進むか</text>
+<line x1="330" y1="56" x2="190" y2="95" class="xp-line" marker-end="url(#t-arr)"/>
+<line x1="370" y1="56" x2="510" y2="95" class="xp-line" marker-end="url(#t-arr)"/>
+<rect x="10" y="185" width="140" height="50" rx="6" class="xp-box"/>
+<rect x="180" y="185" width="140" height="50" rx="6" class="xp-box"/>
+<rect x="370" y="185" width="140" height="50" rx="6" class="xp-box"/>
+<rect x="540" y="185" width="140" height="50" rx="6" class="xp-box"/>
+<text x="80" y="206" text-anchor="middle" class="xp-text">葉</text>
+<text x="80" y="224" text-anchor="middle" class="xp-small">値 → ROWID（値の順）</text>
+<text x="250" y="206" text-anchor="middle" class="xp-text">葉</text>
+<text x="250" y="224" text-anchor="middle" class="xp-small">値 → ROWID（値の順）</text>
+<text x="440" y="206" text-anchor="middle" class="xp-text">葉</text>
+<text x="440" y="224" text-anchor="middle" class="xp-small">値 → ROWID（値の順）</text>
+<text x="610" y="206" text-anchor="middle" class="xp-text">葉</text>
+<text x="610" y="224" text-anchor="middle" class="xp-small">値 → ROWID（値の順）</text>
+<line x1="165" y1="141" x2="90" y2="185" class="xp-line" marker-end="url(#t-arr)"/>
+<line x1="205" y1="141" x2="245" y2="185" class="xp-line" marker-end="url(#t-arr)"/>
+<line x1="495" y1="141" x2="450" y2="185" class="xp-line" marker-end="url(#t-arr)"/>
+<line x1="535" y1="141" x2="605" y2="185" class="xp-line" marker-end="url(#t-arr)"/>
+<line x1="152" y1="210" x2="178" y2="210" class="xp-dash" marker-start="url(#t-arr)" marker-end="url(#t-arr)"/>
+<line x1="322" y1="210" x2="368" y2="210" class="xp-dash" marker-start="url(#t-arr)" marker-end="url(#t-arr)"/>
+<line x1="512" y1="210" x2="538" y2="210" class="xp-dash" marker-start="url(#t-arr)" marker-end="url(#t-arr)"/>
+<text x="690" y="256" text-anchor="end" class="xp-small">葉どうしは左右の隣とつながっている（値の順に横へたどれる）</text>
+<text x="8" y="284" class="xp-accent">表</text>
+<rect x="10" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="95" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="180" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="265" y="292" width="75" height="34" rx="4" class="xp-hot"/>
+<rect x="350" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="435" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="520" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<rect x="605" y="292" width="75" height="34" rx="4" class="xp-box"/>
+<text x="302" y="314" text-anchor="middle" class="xp-small">行の中身</text>
+<line x1="250" y1="235" x2="295" y2="290" class="xp-dash" marker-end="url(#t-arr)"/>
+<text x="258" y="276" text-anchor="end" class="xp-small">ROWID で直接読む</text>
+</svg>
+<figcaption>B-tree 索引の構造。上の 3 段が索引、下の列が表のブロックである。</figcaption>
+</figure>
+
+<table>
+<thead>
+<tr>
+<th>部品</th>
+<th>役割</th>
+<th>辞典にたとえると</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ルート</td>
+<td>最初に読むブロック。どのブランチ（または葉）に進むかが書いてある</td>
+<td>背の「つめ」（あ・か・さ…）</td>
+</tr>
+<tr>
+<td>ブランチ</td>
+<td>目次の目次。葉が多くてルートに書ききれないときに入る</td>
+<td>—</td>
+</tr>
+<tr>
+<td>葉</td>
+<td>値と ROWID の組が、値の順に並んでいる</td>
+<td>開いたページ</td>
+</tr>
+<tr>
+<td>表のブロック</td>
+<td>実際の行</td>
+<td>説明の本文</td>
+</tr>
+</tbody>
+</table>
+<p>木の段数は <code>USER_INDEXES.BLEVEL</code> で確かめる。<code>BLEVEL</code> は「ルートから葉までの段数 − 1」である。</p>
+<pre><code class="language-sql">SELECT index_name, blevel, leaf_blocks, num_rows
+FROM   user_indexes
+WHERE  table_name = 'ORDERS'
+ORDER  BY index_name;
+</code></pre>
+<pre><code class="language-text">INDEX_NAME               BLEVEL LEAF_BLOCKS   NUM_ROWS
+-------------------- ---------- ----------- ----------
+ORDERS_CUSTOMER_IX            1         418     200000
+ORDERS_DATE_IX                2         531     200000
+ORDERS_STATUS_IX              2         531     200000
+SYS_C008729                   1         374     200000
+</code></pre>
+<p>主キー索引 <code>SYS_C008729</code>（BLEVEL 1）はルートと葉の 2 段、<code>ORDERS_DATE_IX</code>（BLEVEL 2）はルート・ブランチ・葉の 3 段である。</p>
+<h3 id="_3">ルートブロックの中身</h3>
+<p>ルートには、葉ごとの区切り（キーの範囲 → 葉ブロック）が書いてある。主キー索引は葉が 374 個あり、葉 1 個あたり約 535 件が入る。</p>
+<table>
+<thead>
+<tr>
+<th>ルートに書いてある区切り</th>
+<th>進む先</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>order_id 1 〜 535</td>
+<td>葉 1</td>
+<td></td>
+</tr>
+<tr>
+<td>order_id 536 〜 1070</td>
+<td>葉 2</td>
+<td></td>
+</tr>
+<tr>
+<td>…</td>
+<td>…</td>
+<td></td>
+</tr>
+<tr>
+<td>order_id 12306 〜 12840</td>
+<td>葉 24</td>
+<td>← 12345 はここ</td>
+</tr>
+<tr>
+<td>…</td>
+<td>…</td>
+<td></td>
+</tr>
+<tr>
+<td>order_id … 〜 200000</td>
+<td>葉 374</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>区切りの数値は、平均の件数から計算した説明用の値であり、実際のブロックの区切りとは異なる。</p>
+<h3 id="1-index-unique-scan">1 行を引く: INDEX UNIQUE SCAN の経路</h3>
+<p><code>order_id = 12345</code> を引くときに通る経路を図にする。太線が実際に読んだブロックである。</p>
+<figure class="xp-figure">
+<svg viewBox="0 0 700 300" role="img" aria-label="INDEX UNIQUE SCAN の経路。ルートで葉 24 と分かり、葉 24 で ROWID が分かり、表のブロック 225 を読む。合計 3 ブロック">
+<defs>
+<marker id="u-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow"/></marker>
+<marker id="u-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow-hot"/></marker>
+</defs>
+<text x="8" y="20" class="xp-accent">索引 SYS_C008729（2 段）</text>
+<rect x="270" y="30" width="160" height="58" rx="6" class="xp-hot"/>
+<text x="350" y="51" text-anchor="middle" class="xp-text">ルート</text>
+<text x="350" y="67" text-anchor="middle" class="xp-small">「12345 は葉 24」</text>
+<text x="350" y="81" text-anchor="middle" class="xp-small">1 ブロック目</text>
+<rect x="20" y="125" width="150" height="62" rx="6" class="xp-box"/>
+<text x="95" y="150" text-anchor="middle" class="xp-text">葉 1</text>
+<text x="95" y="168" text-anchor="middle" class="xp-mono">1 〜 535</text>
+<rect x="240" y="120" width="220" height="80" rx="6" class="xp-hot"/>
+<text x="350" y="141" text-anchor="middle" class="xp-text">葉 24</text>
+<text x="350" y="159" text-anchor="middle" class="xp-mono">12345 → ROWID …ACt</text>
+<text x="350" y="175" text-anchor="middle" class="xp-mono">12346 → ROWID …ACu</text>
+<text x="350" y="192" text-anchor="middle" class="xp-small">2 ブロック目</text>
+<rect x="530" y="125" width="150" height="62" rx="6" class="xp-box"/>
+<text x="605" y="150" text-anchor="middle" class="xp-text">葉 374</text>
+<text x="605" y="168" text-anchor="middle" class="xp-mono">… 〜 200000</text>
+<line x1="300" y1="88" x2="120" y2="124" class="xp-line" marker-end="url(#u-arr)"/>
+<line x1="350" y1="88" x2="350" y2="118" class="xp-path" marker-end="url(#u-hot)"/>
+<line x1="400" y1="88" x2="580" y2="124" class="xp-line" marker-end="url(#u-arr)"/>
+<text x="8" y="232" class="xp-accent">表 ORDERS（1000 ブロック）</text>
+<rect x="240" y="240" width="220" height="52" rx="6" class="xp-hot"/>
+<text x="350" y="262" text-anchor="middle" class="xp-text">ブロック 225</text>
+<text x="350" y="280" text-anchor="middle" class="xp-small">受注 12345 の行（3 ブロック目）</text>
+<line x1="350" y1="200" x2="350" y2="238" class="xp-path" marker-end="url(#u-hot)"/>
+<text x="362" y="224" class="xp-small">ROWID で直接読む</text>
+</svg>
+<figcaption>INDEX UNIQUE SCAN の経路。色の付いた枠と太線が実際に読んだブロックである。葉のキーの範囲は説明用であり、ROWID とブロック番号 225 は実測値である。</figcaption>
+</figure>
+
+<pre><code class="language-text">| Id  | Operation                   | Name        | Starts | E-Rows | A-Rows | Buffers |
+|   0 | SELECT STATEMENT            |             |      1 |        |      1 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| ORDERS      |      1 |      1 |      1 |       3 |
+|*  2 |   INDEX UNIQUE SCAN         | SYS_C008729 |      1 |      1 |      1 |       2 |
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>読んだブロック</th>
+<th>中身</th>
+<th>計画の行</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 ブロック目</td>
+<td>索引のルート</td>
+<td>Id 2（索引の Buffers 2）</td>
+</tr>
+<tr>
+<td>2 ブロック目</td>
+<td>索引の葉 24</td>
+<td>Id 2</td>
+</tr>
+<tr>
+<td>3 ブロック目</td>
+<td>表のブロック 225</td>
+<td>Id 1（3 − 2 = 1）</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">索引の段数と、表を読む手間は別である</p>
+<p>索引をたどって分かるのは行の住所（ROWID）までである。
+索引の段数は「住所を調べる手間」、表のブロックを読むのは「その家を訪ねる手間」であり、別々にかかる。</p>
+</div>
+<h3 id="index-range-scan">複数の行を引く: INDEX RANGE SCAN の経路</h3>
+<p>範囲の条件（<code>BETWEEN</code> や <code>&gt;=</code>）や重複のある値では、最初の葉にたどり着いた後、<strong>隣の葉へ横に読み進める</strong>。条件に合わない値が出てきたところで止まる。</p>
+<p><code>order_date BETWEEN 3/1 AND 3/2</code> を引く場合の経路を図にする。色の付いた枠と太線が実際に読んだ部分である。</p>
+<figure class="xp-figure">
+<svg viewBox="0 0 700 370" role="img" aria-label="INDEX RANGE SCAN の経路。ルートとブランチを降りて 3/1 の葉に着き、隣の葉へ横に読み進め、3/3 が出たら止める。葉の ROWID が指す表のブロックを読む">
+<defs>
+<marker id="r-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow"/></marker>
+<marker id="r-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow-hot"/></marker>
+</defs>
+<text x="8" y="20" class="xp-accent">索引</text>
+<rect x="300" y="10" width="100" height="40" rx="6" class="xp-hot"/>
+<text x="350" y="35" text-anchor="middle" class="xp-text">ルート</text>
+<rect x="180" y="82" width="110" height="40" rx="6" class="xp-hot"/>
+<text x="235" y="107" text-anchor="middle" class="xp-text">ブランチ</text>
+<rect x="410" y="82" width="110" height="40" rx="6" class="xp-box"/>
+<text x="465" y="107" text-anchor="middle" class="xp-text">ブランチ</text>
+<line x1="330" y1="50" x2="245" y2="81" class="xp-path" marker-end="url(#r-hot)"/>
+<line x1="370" y1="50" x2="460" y2="81" class="xp-line" marker-end="url(#r-arr)"/>
+<text x="20" y="62" class="xp-small">① ルート「3/1 はこのブランチ」</text>
+<text x="20" y="146" class="xp-small">② ブランチ「3/1 はこの葉から」</text>
+<rect x="10" y="165" width="118" height="46" rx="6" class="xp-box"/>
+<rect x="148" y="165" width="118" height="46" rx="6" class="xp-hot"/>
+<rect x="286" y="165" width="118" height="46" rx="6" class="xp-hot"/>
+<rect x="424" y="165" width="118" height="46" rx="6" class="xp-hot"/>
+<rect x="562" y="165" width="118" height="46" rx="6" class="xp-box"/>
+<text x="69" y="193" text-anchor="middle" class="xp-mono">… 〜 2/29</text>
+<text x="207" y="193" text-anchor="middle" class="xp-mono">2/29 〜 3/1</text>
+<text x="345" y="193" text-anchor="middle" class="xp-mono">3/1 〜 3/2</text>
+<text x="483" y="193" text-anchor="middle" class="xp-mono">3/2 〜 3/3</text>
+<text x="621" y="193" text-anchor="middle" class="xp-mono">3/3 〜 …</text>
+<line x1="225" y1="122" x2="207" y2="164" class="xp-path" marker-end="url(#r-hot)"/>
+<line x1="210" y1="122" x2="80" y2="164" class="xp-line" marker-end="url(#r-arr)"/>
+<line x1="450" y1="122" x2="483" y2="164" class="xp-line" marker-end="url(#r-arr)"/>
+<line x1="490" y1="122" x2="610" y2="164" class="xp-line" marker-end="url(#r-arr)"/>
+<line x1="266" y1="188" x2="285" y2="188" class="xp-path" marker-end="url(#r-hot)"/>
+<line x1="404" y1="188" x2="423" y2="188" class="xp-path" marker-end="url(#r-hot)"/>
+<text x="207" y="230" text-anchor="middle" class="xp-small">③ ここから読み始める</text>
+<text x="345" y="230" text-anchor="middle" class="xp-small">④ 隣の葉へ</text>
+<text x="483" y="230" text-anchor="middle" class="xp-small">⑤ 3/3 が出たら止める</text>
+<text x="8" y="292" class="xp-accent">表</text>
+<rect x="14" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<rect x="70" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="126" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<rect x="182" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="238" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="294" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<rect x="350" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="406" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<rect x="462" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="518" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<rect x="574" y="300" width="50" height="32" rx="4" class="xp-hot"/>
+<rect x="630" y="300" width="50" height="32" rx="4" class="xp-box"/>
+<line x1="200" y1="240" x2="97" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<line x1="214" y1="240" x2="263" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<line x1="338" y1="240" x2="207" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<line x1="352" y1="240" x2="487" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<line x1="476" y1="240" x2="375" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<line x1="490" y1="240" x2="599" y2="298" class="xp-dash" marker-end="url(#r-arr)"/>
+<text x="350" y="356" text-anchor="middle" class="xp-small">ROWID が指すブロックだけを読む。行が散らばっていれば、読むブロックは行数と同じだけ増える</text>
+</svg>
+<figcaption>INDEX RANGE SCAN の経路。索引は「段数 + 横に読んだ葉」、表は「ROWID が指すブロックの数」だけ読む。</figcaption>
+</figure>
+
+<p>索引の部分は、段数 + 横に読んだ葉の枚数で済む。表の部分は、<strong>ROWID が指すブロックの数</strong>だけ読む。同じ値の行が表の中で散らばっていれば、表を読むブロックは行数と同じだけ増える（<a href="04-access-paths.html">4-2</a> の「同じ日付の行はどこにあるか」を参照）。</p>
+<h2 id="3">3. 件数が増えても検索が遅くならない理由</h2>
+<p>目次が大きくなったら、1 ブロックに詰め込むのではなく段を増やす。1 ブロック（標準 8KB）に区切りが約 500 個入るとした場合の概算は次のとおりである。</p>
+<table>
+<thead>
+<tr>
+<th>段数</th>
+<th>扱える件数の目安</th>
+<th>1 行を探すのに読む索引ブロック</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2 段（ルート → 葉）</td>
+<td>約 25 万件</td>
+<td>2</td>
+</tr>
+<tr>
+<td>3 段（ルート → ブランチ → 葉）</td>
+<td>約 1 億件</td>
+<td>3</td>
+</tr>
+<tr>
+<td>4 段</td>
+<td>約 600 億件</td>
+<td>4</td>
+</tr>
+</tbody>
+</table>
+<p>キーの長さによって大きく変わるため、目安として扱う。件数が 400 倍になっても、読むブロックは 1 つしか増えない。</p>
+<p>ブロックの中の項目は値の順に並んでいるので、二分探索で探せる。区切りが 500 個あっても 9 回ほどの比較で済み、しかもメモリ上の処理である。したがって、検索の手間はおおむね<strong>段数 = 読むブロック数</strong>で決まる。</p>
+<h3 id="_4">段数の上限</h3>
+<p>段を持つのは索引の木であり、ブロックではない。実務では 2〜4 段（BLEVEL 1〜3）がほとんどである。</p>
+<p>上限は公式ドキュメントに明記されていない。Oracle-L の議論では、22〜24 段あたりという非公式の報告がある（<a href="https://www.orafaq.com/maillist/oracle-l/2004/03/10/1339.htm">Oracle-L, 2004</a>）。実務で上限に達することはまずない。BLEVEL が件数から予想されるより大きい場合は、長すぎるキーを疑う。</p>
+<h2 id="4">4. ブロックの中は並んでいるか</h2>
+<p>索引と表で異なる。</p>
+<table>
+<thead>
+<tr>
+<th>ブロック</th>
+<th>中身の順番</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引ブロック</td>
+<td><strong>キーの順に並んでいる</strong>。新しい値は正しい位置に差し込まれる。だから二分探索ができる</td>
+</tr>
+<tr>
+<td>表ブロック（通常のヒープ表）</td>
+<td><strong>並んでいない</strong>。空きのあるブロックに、空いている場所から行を入れる</td>
+</tr>
+</tbody>
+</table>
+<p>ORDERS が受注番号の順に入っているように見えるのは、作成時に番号順で一括 INSERT したからにすぎない。DELETE で空いた場所に別の行が入ったり、UPDATE で行が伸びて移動したりすると、順番は崩れる。</p>
+<div class="admonition warning">
+<p class="admonition-title">ORDER BY のない SELECT の順番は保証されない</p>
+<p>表から返る行の順番は、ブロック内の置き場所や実行計画によって変わる。
+順番が必要なら、必ず <code>ORDER BY</code> を書く。</p>
+</div>
+<p>行を特定の列の順に並べて保存したい場合は、次の方法がある。</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>内容</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引構成表（IOT）</td>
+<td>表そのものを主キー順の B-tree として保存する</td>
+<td>主キー以外の列での検索には二次索引が要る</td>
+</tr>
+<tr>
+<td>並べて作り直す</td>
+<td><code>CREATE TABLE ... AS SELECT ... ORDER BY</code> や <code>ALTER TABLE ... MOVE</code> で、ある列の順に入れ直す</td>
+<td>その後の DML で再び崩れていく</td>
+</tr>
+</tbody>
+</table>
+<p>どちらの方法でも、並べ替えの基準にできる列は 1 つ（1 組）だけである。受注番号の順に並べれば日付の順にはならない。</p>
+<h3 id="insert">まとまり具合を決めるのは INSERT の順番</h3>
+<p>ある列で引いたときに表の行がまとまっているかは、<strong>INSERT した順番とその列の値の順番が一致しているか</strong>で決まる。</p>
+<table>
+<thead>
+<tr>
+<th>列</th>
+<th>INSERT の順番との関係</th>
+<th>1 ブロックの中身</th>
+<th>CLUSTERING_FACTOR</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>受注番号</td>
+<td>INSERT の順番と同じ順に増える</td>
+<td>連続した番号が約 200 件</td>
+<td>960（≒ 表のブロック数）</td>
+</tr>
+<tr>
+<td>日付</td>
+<td>1 件ごとに次の日へ進み、1000 件で循環する</td>
+<td>200 件すべて違う日付</td>
+<td>200,000（＝ 行数）</td>
+</tr>
+</tbody>
+</table>
+<p><code>CLUSTERING_FACTOR</code> は、索引の順に全行をたどったときに表のブロックを何回切り替えるかの数である。表のブロック数に近いほど行がまとまっており、行数に近いほど散らばっている。</p>
+<h2 id="5">5. 複合索引</h2>
+<h3 id="_5">複合索引の並び方</h3>
+<p>複数の列をまとめた索引を<strong>複合索引</strong>という。項目は<strong>1 列目の順に並び、1 列目が同じ値の中で 2 列目の順に並ぶ</strong>。電話帳が「姓 → 名」の順に並んでいるのと同じである。</p>
+<p><code>(order_date, amount)</code> の索引の葉は、次のように並ぶ（値は説明用の作例）。</p>
+<pre><code class="language-text"> order_date   amount   ROWID
+ ──────────  ───────  ──────
+ 2024-02-29    48500   …
+ 2024-03-01      500   …   ┐
+ 2024-03-01    13000   …   │ 3/1 の中は amount の順
+ 2024-03-01    49500   …   │
+ 2024-03-01    49900   …   ┘
+ 2024-03-02     1300   …   ┐
+ 2024-03-02    49100   …   │ 3/2 の中も amount の順
+ 2024-03-02    49700   …   ┘
+ 2024-03-03      800   …
+</code></pre>
+<p><code>amount</code> だけを見ると、索引全体では順番に並んでいない（49900 の次に 1300 が来る）。<strong>2 列目以降は、前の列の値が同じ範囲の中でしか並んでいない。</strong> この性質から、複合索引のすべての規則が導かれる。</p>
+<h3 id="1">効果 1: 表を読む前に絞り込める</h3>
+<p>「3/1〜3/2 の受注のうち、金額が 49000 より大きいもの」を取り出す。まず単一列の索引 <code>(order_date)</code> で実行する。</p>
+<pre><code class="language-text">| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+|   0 | SELECT STATEMENT                     |                |      1 |        |      1 |00:00:00.01 |     404 |
+|   1 |  SORT AGGREGATE                      |                |      1 |      1 |      1 |00:00:00.01 |     404 |
+|*  2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS         |      1 |     18 |     16 |00:00:00.01 |     404 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_IX |      1 |    600 |    400 |00:00:00.01 |       4 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(&quot;AMOUNT&quot;&gt;49000)
+   3 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;ORDER_DATE&quot;&lt;=TO_DATE(' 2024-03-02 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<p>索引には <code>amount</code> が入っていないので、日付が合う 400 件すべてについて表を読み、表で <code>amount</code> を見て 384 件を捨てている。</p>
+<p>次に、複合索引 <code>(order_date, amount)</code> を作って同じ SQL を実行する。</p>
+<pre><code class="language-sql">CREATE INDEX orders_date_amount_ix ON orders (order_date, amount);
+</code></pre>
+<pre><code class="language-text">| Id  | Operation         | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+|   0 | SELECT STATEMENT  |                       |      1 |        |      1 |00:00:00.01 |       4 |      3 |
+|   1 |  SORT AGGREGATE   |                       |      1 |      1 |      1 |00:00:00.01 |       4 |      3 |
+|*  2 |   INDEX RANGE SCAN| ORDERS_DATE_AMOUNT_IX |      1 |     18 |     16 |00:00:00.01 |       4 |      3 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;AMOUNT&quot;&gt;49000 AND &quot;ORDER_DATE&quot;&lt;=TO_DATE(' 2024-03-02 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+       filter(&quot;AMOUNT&quot;&gt;49000)
+</code></pre>
+<p><code>Reads</code> は、メモリになかったためディスクから読んだブロック数である。索引を作った直後なので現れている。</p>
+<figure class="xp-figure">
+<svg viewBox="0 0 700 260" role="img" aria-label="単一列索引では 400 件分の表ブロックを読んでから 384 件を捨てる。複合索引では索引の中で 16 件に絞り、表は読まない">
+<defs>
+<marker id="c-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="xp-arrow"/></marker>
+</defs>
+<text x="10" y="20" class="xp-accent">単一列索引 (order_date)</text>
+<rect x="10" y="32" width="320" height="42" rx="6" class="xp-box"/>
+<text x="170" y="58" text-anchor="middle" class="xp-text">索引: 日付が合う 400 件</text>
+<line x1="170" y1="74" x2="170" y2="100" class="xp-line" marker-end="url(#c-arr)"/>
+<text x="180" y="92" class="xp-small">ROWID 400 個</text>
+<rect x="10" y="102" width="320" height="42" rx="6" class="xp-hot"/>
+<text x="170" y="128" text-anchor="middle" class="xp-text">表: 400 ブロック読む</text>
+<line x1="170" y1="144" x2="170" y2="170" class="xp-line" marker-end="url(#c-arr)"/>
+<rect x="10" y="172" width="320" height="42" rx="6" class="xp-box"/>
+<text x="170" y="198" text-anchor="middle" class="xp-text">amount で 384 件捨てる → 16 件</text>
+<text x="10" y="246" class="xp-text">Buffers 404</text>
+<text x="370" y="20" class="xp-accent">複合索引 (order_date, amount)</text>
+<rect x="370" y="32" width="320" height="62" rx="6" class="xp-box"/>
+<text x="530" y="58" text-anchor="middle" class="xp-text">索引: 日付が合う 400 項目を</text>
+<text x="530" y="78" text-anchor="middle" class="xp-text">索引の中で amount で絞る → 16 件</text>
+<line x1="530" y1="94" x2="530" y2="130" class="xp-line" marker-end="url(#c-arr)"/>
+<rect x="370" y="132" width="320" height="42" rx="6" class="xp-dashbox"/>
+<text x="530" y="158" text-anchor="middle" class="xp-small">表は読まない</text>
+<text x="370" y="246" class="xp-accent">Buffers 4</text>
+</svg>
+<figcaption>同じ SQL を単一列索引と複合索引で実行したときの流れ。</figcaption>
+</figure>
+
+<table>
+<thead>
+<tr>
+<th>索引</th>
+<th>表を読んだブロック</th>
+<th>合計 Buffers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(order_date)</code></td>
+<td>400</td>
+<td>404</td>
+</tr>
+<tr>
+<td><code>(order_date, amount)</code></td>
+<td>0</td>
+<td><strong>4</strong></td>
+</tr>
+</tbody>
+</table>
+<p>この例では、SELECT が <code>SUM(amount)</code> だけで、必要な列がすべて索引に入っている。そのため表を一度も読まずに済んだ（<code>TABLE ACCESS</code> の行がない）。</p>
+<h3 id="2">効果 2: 索引だけで答えを出す（カバリング）</h3>
+<p>索引にない列（<code>status</code>）も SELECT すると、表を読む行が復活する。</p>
+<pre><code class="language-text">| Id  | Operation                            | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+|   0 | SELECT STATEMENT                     |                       |      1 |        |      1 |00:00:00.01 |      20 |
+|   1 |  SORT AGGREGATE                      |                       |      1 |      1 |      1 |00:00:00.01 |      20 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS                |      1 |     18 |     16 |00:00:00.01 |      20 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_AMOUNT_IX |      1 |     18 |     16 |00:00:00.01 |       4 |
+</code></pre>
+<p>それでも、表を読むのは絞り込んだ後の 16 件だけなので、合計は 20 ブロックで済む。</p>
+<table>
+<thead>
+<tr>
+<th>SELECT する列</th>
+<th>表を読むか</th>
+<th>Buffers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引の列だけ（<code>SUM(amount)</code>）</td>
+<td>読まない</td>
+<td>4</td>
+</tr>
+<tr>
+<td>索引にない列も（<code>MAX(status)</code>）</td>
+<td>絞り込んだ 16 件だけ読む</td>
+<td>20</td>
+</tr>
+</tbody>
+</table>
+<p>必要な列をすべて含む索引を<strong>カバリング索引</strong>と呼ぶ。列を足すほど索引は大きくなるので、よく実行される SQL に絞って使う。</p>
+<h3 id="1-range-scan">列の順番 1: 先頭列の条件がないと RANGE SCAN できない</h3>
+<p><code>(order_date, amount)</code> の索引に対して、2 列目の <code>amount</code> だけで検索する。</p>
+<pre><code class="language-sql">SELECT COUNT(*) FROM orders WHERE amount = 25500;
+</code></pre>
+<pre><code class="language-text">| Id  | Operation             | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+|   0 | SELECT STATEMENT      |                       |      1 |        |      1 |00:00:00.03 |     676 |    664 |
+|   1 |  SORT AGGREGATE       |                       |      1 |      1 |      1 |00:00:00.03 |     676 |    664 |
+|*  2 |   INDEX FAST FULL SCAN| ORDERS_DATE_AMOUNT_IX |      1 |      4 |      4 |00:00:00.01 |     676 |    664 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(&quot;AMOUNT&quot;=25500)
+</code></pre>
+<p>述語が <code>access</code> ではなく <code>filter</code> になっている。<code>amount = 25500</code> の項目は、索引のあちこちの日付の中に散らばっている（上の並び方の図を参照）。そのため木をたどって 1 か所に降りることができず、索引を全部読んで（676 ブロック）ふるいにかけている。</p>
+<p>電話帳で「名が『太郎』の人」を探すのと同じである。姓が分からなければ、全ページを見るしかない。</p>
+<div class="admonition note">
+<p class="admonition-title">INDEX SKIP SCAN</p>
+<p>先頭列の値の種類が少ない場合、オプティマイザは先頭列の値ごとに木を降りる <strong>INDEX SKIP SCAN</strong> を選ぶことがある。
+この例では先頭列（日付）が 1000 種類あるため選ばれていない。</p>
+</div>
+<h3 id="2_1">列の順番 2: 等価条件の列を先、範囲条件の列を後</h3>
+<p>「顧客 42 の、2024 年以降の受注」を数える。条件は等価（<code>customer_id = 42</code>）と範囲（<code>order_date &gt;= …</code>）の組である。列の順番だけが違う 2 つの索引で比べる。</p>
+<pre><code class="language-sql">CREATE INDEX orders_cust_date_ix ON orders (customer_id, order_date);
+CREATE INDEX orders_date_cust_ix ON orders (order_date, customer_id);
+
+SELECT COUNT(*) FROM orders
+WHERE  customer_id = 42 AND order_date &gt;= DATE '2024-01-01';
+</code></pre>
+<p><strong>(customer_id, order_date) — 等価の列が先</strong></p>
+<pre><code class="language-text">| Id  | Operation         | Name                | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+|   0 | SELECT STATEMENT  |                     |      1 |        |      1 |00:00:00.01 |       3 |
+|   1 |  SORT AGGREGATE   |                     |      1 |      1 |      1 |00:00:00.01 |       3 |
+|*  2 |   INDEX RANGE SCAN| ORDERS_CUST_DATE_IX |      1 |     13 |     20 |00:00:00.01 |       3 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access(&quot;CUSTOMER_ID&quot;=42 AND &quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-01-01 00:00:00',
+              'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<p><strong>(order_date, customer_id) — 範囲の列が先</strong></p>
+<pre><code class="language-text">| Id  | Operation         | Name                | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+|   0 | SELECT STATEMENT  |                     |      1 |        |      1 |00:00:00.01 |     412 |    410 |
+|   1 |  SORT AGGREGATE   |                     |      1 |      1 |      1 |00:00:00.01 |     412 |    410 |
+|*  2 |   INDEX RANGE SCAN| ORDERS_DATE_CUST_IX |      1 |     13 |     20 |00:00:00.01 |     412 |    410 |
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;CUSTOMER_ID&quot;=42)
+       filter(&quot;CUSTOMER_ID&quot;=42)
+</code></pre>
+<p>結果はどちらも 20 件だが、読んだブロックは 3 と 412 で、100 倍以上違う。葉の並び方を描くと理由が分かる（値は説明用の作例）。</p>
+<figure class="xp-figure">
+<svg viewBox="0 0 720 400" role="img" aria-label="複合索引の列の順番による違い。等価の列が先なら顧客 42 の項目は連続しており 20 項目だけ読む。範囲の列が先なら 2024-01-01 以降の全項目を読んで顧客 42 をふるいにかける">
+<text x="10" y="20" class="xp-accent">(customer_id, order_date)</text>
+<text x="10" y="36" class="xp-small">等価の列が先</text>
+<text x="370" y="20" class="xp-accent">(order_date, customer_id)</text>
+<text x="370" y="36" class="xp-small">範囲の列が先</text>
+<rect x="10" y="48" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="10" y="76" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="10" y="104" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="10" y="132" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="10" y="160" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="10" y="188" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="10" y="216" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="10" y="244" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="10" y="272" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="10" y="300" width="200" height="26" rx="3" class="xp-box"/>
+<text x="22" y="66" class="xp-mono">41  2025-09-20</text>
+<text x="22" y="94" class="xp-mono">42  2023-02-11</text>
+<text x="22" y="122" class="xp-mono">42  2023-11-08</text>
+<text x="22" y="150" class="xp-mono">42  2024-01-17  ✓</text>
+<text x="22" y="178" class="xp-mono">42  2024-06-03  ✓</text>
+<text x="22" y="206" class="xp-mono">42  …           ✓</text>
+<text x="22" y="234" class="xp-mono">42  2025-08-30  ✓</text>
+<text x="22" y="262" class="xp-mono">43  2023-01-05</text>
+<text x="22" y="290" class="xp-mono">43  2023-04-22</text>
+<text x="22" y="318" class="xp-mono">…</text>
+<path d="M220,132 h8 v110 h-8" class="xp-path"/>
+<text x="238" y="170" class="xp-accent">読む範囲</text>
+<text x="238" y="188" class="xp-text">20 項目</text>
+<text x="238" y="206" class="xp-text">3 ブロック</text>
+<rect x="370" y="48" width="200" height="26" rx="3" class="xp-box"/>
+<rect x="370" y="76" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="104" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="132" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="160" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="188" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="216" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="244" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="272" width="200" height="26" rx="3" class="xp-hot"/>
+<rect x="370" y="300" width="200" height="26" rx="3" class="xp-hot"/>
+<text x="382" y="66" class="xp-mono">2023-12-31  9999</text>
+<text x="382" y="94" class="xp-mono">2024-01-01     1</text>
+<text x="382" y="122" class="xp-mono">2024-01-01     2</text>
+<text x="382" y="150" class="xp-mono">…</text>
+<text x="382" y="178" class="xp-mono">2024-01-01    42  ✓</text>
+<text x="382" y="206" class="xp-mono">…</text>
+<text x="382" y="234" class="xp-mono">2024-01-02     1</text>
+<text x="382" y="262" class="xp-mono">…</text>
+<text x="382" y="290" class="xp-mono">2024-01-02    42  ✓</text>
+<text x="382" y="318" class="xp-mono">…（最終日まで）</text>
+<path d="M580,76 h8 v250 h-8" class="xp-path"/>
+<text x="598" y="182" class="xp-accent">読む範囲</text>
+<text x="598" y="200" class="xp-text">約 12.7 万項目</text>
+<text x="598" y="218" class="xp-text">約 410 ブロック</text>
+<text x="10" y="356" class="xp-small">顧客 42 の項目は 1 か所に固まっている。</text>
+<text x="10" y="374" class="xp-small">その中は日付順なので、2024-01-01 から読めばよい。</text>
+<text x="370" y="356" class="xp-small">顧客 42 の項目は 1 日に 1 件ずつ飛び飛び。</text>
+<text x="370" y="374" class="xp-small">範囲全体を読んで ✓ だけ残すしかない。</text>
+</svg>
+<figcaption>複合索引の葉の並び方（値は説明用の作例）。色の付いた行が読んだ項目、✓ が条件に合う項目である。</figcaption>
+</figure>
+
+<ul>
+<li><strong>等価の列が先</strong>の場合、<code>customer_id = 42</code> の項目は 1 か所に固まっている。その中は日付順なので、2024-01-01 の位置に降りて、42 が終わるまで読めばよい。</li>
+<li><strong>範囲の列が先</strong>の場合、2024-01-01 以降の項目は、日付ごとに全顧客分が並ぶ。顧客 42 の項目は 1 日に 1 件ずつ飛び飛びにしかないので、範囲全体（2024-01-01〜最終日の 635 日 × 200 件 ≒ 12.7 万項目、約 410 ブロック）を読んでふるいにかけるしかない。</li>
+</ul>
+<p>Predicate Information にもこの違いが出ている。範囲が先の索引では、<code>CUSTOMER_ID=42</code> が <code>access</code> だけでなく <code>filter</code> にも現れる。木を降りる位置を決めるのには日付しか使えず、顧客の条件は読んだ項目をふるいにかけるのに使われている、という意味である。</p>
+<div class="admonition tip">
+<p class="admonition-title">規則</p>
+<p>複合索引の列は <strong>等価条件（<code>=</code>）の列を先、範囲条件（<code>&gt;=</code>, <code>BETWEEN</code>, <code>LIKE 'abc%'</code>）の列を後</strong> に並べる。
+範囲条件の列より後ろの列は、読む範囲を狭めるのには使えず、ふるいにかけるのにしか使えない。</p>
+</div>
+<p>測り終えたら索引を削除し、スキーマを元に戻す（<code>sql/ch04_composite_index.sql</code> の末尾で行う）。</p>
+<h2 id="6-range-scan">6. 索引があっても RANGE SCAN できない書き方</h2>
+<p>索引は「列の値そのもの」の順に並んでいる。列を加工すると、その順番が使えなくなる。</p>
+<h3 id="_6">列に関数をかける（実測）</h3>
+<p>2024 年 3 月の受注を <code>TRUNC</code> で書いた場合と、範囲で書いた場合を比べる（<code>(order_date, amount)</code> の索引がある状態で測った）。</p>
+<pre><code class="language-sql">-- 列に関数をかける
+WHERE TRUNC(order_date, 'MM') = DATE '2024-03-01'
+-- 同じ意味を範囲で書く
+WHERE order_date &gt;= DATE '2024-03-01' AND order_date &lt; DATE '2024-04-01'
+</code></pre>
+<pre><code class="language-text">TRUNC で書いた場合
+| Id  | Operation             | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+|*  2 |   INDEX FAST FULL SCAN| ORDERS_DATE_AMOUNT_IX |      1 |   2000 |   6200 |00:00:00.02 |     676 |
+
+   2 - filter(TRUNC(INTERNAL_FUNCTION(&quot;ORDER_DATE&quot;),'fmmm')=TO_DATE(' 2024-03-01 00:00:00',
+              'syyyy-mm-dd hh24:mi:ss'))
+
+範囲で書いた場合
+| Id  | Operation         | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+|*  2 |   INDEX RANGE SCAN| ORDERS_DATE_AMOUNT_IX |      1 |   6406 |   6200 |00:00:00.01 |      23 |
+
+   2 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;ORDER_DATE&quot;&lt;TO_DATE(' 2024-04-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>書き方</th>
+<th>操作</th>
+<th>Buffers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TRUNC(order_date, 'MM') = …</code></td>
+<td>INDEX FAST FULL SCAN（全部読んでふるい）</td>
+<td>676</td>
+</tr>
+<tr>
+<td><code>order_date &gt;= … AND order_date &lt; …</code></td>
+<td>INDEX RANGE SCAN</td>
+<td><strong>23</strong></td>
+</tr>
+</tbody>
+</table>
+<p>索引に入っているのは <code>order_date</code> の値であり、<code>TRUNC(order_date, 'MM')</code> の値ではない。そのため木を降りる位置を決められない。関数の結果で探す必要があるなら、関数の式そのものに索引を作る（<strong>ファンクション索引</strong>）。</p>
+<p>TRUNC 版では見積りも外れている（E-Rows 2000 に対して A-Rows 6200）。関数をかけた列には統計がないので、オプティマイザが決め打ちの選択率で見積もるためである。</p>
+<h3 id="_7">そのほかの典型例（この環境では測っていない）</h3>
+<table>
+<thead>
+<tr>
+<th>書き方</th>
+<th>RANGE SCAN できない理由</th>
+<th>書き換えの例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文字列の列と数値を比べる <code>WHERE code = 123</code></td>
+<td>暗黙の型変換で <code>TO_NUMBER(code) = 123</code> になり、列に関数がかかる</td>
+<td><code>WHERE code = '123'</code></td>
+</tr>
+<tr>
+<td>前方が不定の LIKE <code>WHERE name LIKE '%田'</code></td>
+<td>先頭の文字が決まらないと、木を降りる位置が決まらない</td>
+<td>後方一致で探す設計を見直す</td>
+</tr>
+<tr>
+<td>単一列の索引で <code>IS NULL</code></td>
+<td>すべての列が NULL の項目は B-tree 索引に格納されない</td>
+<td>NOT NULL の列と組み合わせた複合索引にする</td>
+</tr>
+<tr>
+<td>複合索引の先頭列に条件がない</td>
+<td>2 列目以降は飛び飛びにしか並んでいない（5 節）</td>
+<td>よく使う条件の列を先頭にする</td>
+</tr>
+</tbody>
+</table>
+<h2 id="7">7. 索引の代償</h2>
+<p>索引は検索を速くするが、無料ではない。</p>
+<ul>
+<li><strong>更新が遅くなる</strong>: 行を INSERT・DELETE するたびに、すべての索引の項目も追加・削除する。索引の列を UPDATE すると、項目を削除して正しい位置に入れ直す</li>
+<li><strong>領域を使う</strong>: ORDERS の索引は 1 つあたり葉が 374〜531 ブロックあり、表（1000 ブロック）の半分前後の大きさがある</li>
+<li><strong>重複した索引は無駄になる</strong>: <code>(order_date)</code> と <code>(order_date, amount)</code> があれば、前者でできることは後者でもほぼできる。先頭の列が同じ索引は統合を検討する</li>
+</ul>
+<h2 id="_8">まとめ</h2>
+<ul>
+<li>索引は「値 → ROWID」の組を値の順に並べた B-tree である。ルート・ブランチが目次、葉が本体で、葉どうしは隣とつながっている</li>
+<li>索引でたどり着けるのは ROWID（住所）までである。索引にない列が必要なら、表のブロックを読む</li>
+<li>検索の手間は、索引の段数（ほぼ一定）と、表を読むブロック数（ROWID の散らばり方しだい）の合計である</li>
+<li>複合索引は 1 列目の順に並び、2 列目は 1 列目が同じ範囲の中でしか並ばない</li>
+<li>複合索引に条件の列を含めると、表を読む前に索引の中で絞り込める。必要な列がすべて揃えば表を読まない</li>
+<li>複合索引の列は「等価条件の列を先、範囲条件の列を後」に並べる。先頭列の条件がなければ RANGE SCAN できない</li>
+<li>列に関数をかけたり、型変換を起こしたりすると、索引の順番が使えなくなる</li>
+</ul>
+</article>
+  </main>
+</div>
+
+<nav class="pager" aria-label="ほかの章へ"></nav>
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="../assets/nav.js"></script>
+</body>
+</html>

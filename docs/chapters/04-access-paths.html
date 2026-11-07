@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04-2 アクセスパス — Oracle 実行計画の読み方</title>
+<meta name="description" content="アクセスパスとは、表から行を取り出す方法のことである。実行計画では、子を持たない行（葉）に現れる。結合や集計の行は、葉から受け取った行を加工しているだけである。行を実際に読んでいるのは葉なので、Buffers の大半も葉で発生する。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&amp;family=Noto+Sans+JP:wght@300;400;500;700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/theme.js"></script>
+</head>
+<body data-root="../" data-page="chapters/04-access-paths.html">
+<header class="site-header">
+  <a class="brand" href="../index.html">oracle<span>/</span>xplan notes</a>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" aria-label="配色を切り替える"></button>
+    <button class="menu-toggle" type="button" aria-label="章の一覧を開く" aria-expanded="false" aria-controls="menu"><span></span><span></span></button>
+  </div>
+</header>
+<div class="menu-overlay" id="menu"><nav class="menu-list" aria-label="章の一覧"></nav></div>
+
+<section class="hero">
+  <div class="hero-bg" aria-hidden="true"></div>
+  <div class="hero-inner">
+    <p class="eyebrow">Chapter 04-2</p>
+    <h1>アクセスパス</h1>
+    <p class="sub">FULL SCAN と各種 INDEX SCAN</p>
+  </div>
+  <svg class="hero-arrow" viewBox="0 0 44 64" aria-hidden="true"><path d="M22 0v62M2 42l20 20 20-20"/></svg>
+</section>
+
+<div class="page-body">
+  <aside class="page-toc" aria-label="このページの目次"><p class="toc-title">目次</p><ul><li><a href="#_1">前提</a></li><li><a href="#index-unique-scan-1">INDEX UNIQUE SCAN — 主キーで 1 行を引く</a></li><li><a href="#index-range-scan">INDEX RANGE SCAN — 範囲や重複のある値を引く</a><ul><li><a href="#_2">表も読む場合</a></li><li><a href="#_3">同じ日付の行はどこにあるか</a></li><li><a href="#_4">連続する受注番号はまとまっている</a></li></ul></li><li><a href="#_5">散らばった行を索引で取る損益分岐点</a><ul><li><a href="#3-buffers-full">3 日分で、Buffers の少ない索引ではなく FULL が選ばれた理由</a></li></ul></li><li><a href="#range-scan">RANGE SCAN が有効かを判断する</a><ul><li><a href="#1">方法 1: 実行した計画で確かめる</a></li><li><a href="#2">方法 2: 実行前に見積もる</a></li></ul></li><li><a href="#table-access-full">TABLE ACCESS FULL — 表を全部読む</a></li><li><a href="#index-fast-full-scan">INDEX FAST FULL SCAN — 索引を表の代わりに全部読む</a></li><li><a href="#index-full-scan-minmax">INDEX FULL SCAN (MIN/MAX) — 索引の端だけを読む</a></li><li><a href="#table-access-by-index-rowid-batched">TABLE ACCESS BY INDEX ROWID BATCHED</a></li><li><a href="#_6">「索引のほうが速い」とは限らない</a><ul><li><a href="#shipped">SHIPPED: ほとんどの行を取るなら索引は損</a></li><li><a href="#pending-15">PENDING: 1.5% しか取らないのに、ほとんど得をしない</a></li><li><a href="#clustering_factor">CLUSTERING_FACTOR — 行のまとまり具合の指標</a></li><li><a href="#e-rows-66667">E-Rows が 66667 になっている理由</a></li></ul></li><li><a href="#_7">まとめ</a></li></ul></aside>
+  <main class="content">
+<article>
+<p><strong>アクセスパス</strong>とは、表から行を取り出す方法のことである。実行計画では、子を持たない行（葉）に現れる。結合や集計の行は、葉から受け取った行を加工しているだけである。行を実際に読んでいるのは葉なので、Buffers の大半も葉で発生する。</p>
+<p>題材の SQL は <code>sql/ch04_access_paths.sql</code> にある。</p>
+<pre><code class="language-sh">docker compose exec oracle sqlplus study/study@FREEPDB1 @/sql/ch04_access_paths.sql
+</code></pre>
+<p>ORDERS 表の大きさを先に確認しておく。</p>
+<pre><code class="language-text">    BLOCKS   NUM_ROWS
+---------- ----------
+      1000     200000
+</code></pre>
+<h2 id="_1">前提</h2>
+<p>ブロック・ROWID・索引の構造（B-tree）・複合索引は <a href="04-index.html">4-1. 索引のしくみ</a> で説明している。このページはそれを読んだ前提で進める。</p>
+<h2 id="index-unique-scan-1">INDEX UNIQUE SCAN — 主キーで 1 行を引く</h2>
+<pre><code class="language-sql">SELECT order_date, amount FROM orders WHERE order_id = 12345;
+</code></pre>
+<pre><code class="language-text">-----------------------------------------------------------------------------------------
+| Id  | Operation                   | Name        | Starts | E-Rows | A-Rows | Buffers |
+-----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |             |      1 |        |      1 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| ORDERS      |      1 |      1 |      1 |       3 |
+|*  2 |   INDEX UNIQUE SCAN         | SYS_C008729 |      1 |      1 |      1 |       2 |
+-----------------------------------------------------------------------------------------
+
+   2 - access(&quot;ORDER_ID&quot;=12345)
+</code></pre>
+<ul>
+<li>主キーや一意索引に、等価条件（<code>=</code>）で 1 行だけを引くときに選ばれる</li>
+<li>索引を根から葉までたどって 2 ブロック、ROWID で表を 1 ブロック読み、合計 3 ブロックで済む</li>
+<li><code>SYS_C</code> で始まる名前は、主キー制約を作ったときにシステムが自動で付けた索引の名前である</li>
+</ul>
+<p><code>TABLE ACCESS BY INDEX ROWID</code> は、索引から得た ROWID（行の住所）を使って、表の行を直接読む操作である。</p>
+<h2 id="index-range-scan">INDEX RANGE SCAN — 範囲や重複のある値を引く</h2>
+<pre><code class="language-sql">SELECT COUNT(amount) FROM orders WHERE order_date = DATE '2024-03-01';
+</code></pre>
+<pre><code class="language-text">--------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows | Buffers |
+--------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |       3 |
+|   1 |  SORT AGGREGATE   |                |      1 |      1 |      1 |       3 |
+|*  2 |   INDEX RANGE SCAN| ORDERS_DATE_IX |      1 |    200 |    200 |       3 |
+--------------------------------------------------------------------------------
+
+   2 - access(&quot;ORDER_DATE&quot;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<ul>
+<li>一意でない索引に等価条件を指定したとき、または <code>BETWEEN</code> や <code>&gt;</code> のような範囲条件を指定したときに選ばれる</li>
+<li>索引の葉を、条件に合う範囲だけ横にたどる</li>
+</ul>
+<p>この計画には <code>TABLE ACCESS</code> がない。<code>amount</code> 列は NOT NULL なので、<code>COUNT(amount)</code> は行数を数えるのと同じ意味になる。行数は索引だけで数えられるため、表を読まずに答えが出ている。<strong>SQL が必要とする列がすべて索引にあれば、表を読まずに済む。</strong></p>
+<h3 id="_2">表も読む場合</h3>
+<p><code>amount</code> の合計を求めると、値を取りに表を読む必要が生じる。</p>
+<pre><code class="language-sql">SELECT SUM(amount) FROM orders WHERE order_date = DATE '2024-03-01';
+</code></pre>
+<pre><code class="language-text">---------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |      1 |     203 |
+|   1 |  SORT AGGREGATE                      |                |      1 |      1 |      1 |     203 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS         |      1 |    200 |    200 |     203 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_IX |      1 |    200 |    200 |       3 |
+---------------------------------------------------------------------------------------------------
+
+   3 - access(&quot;ORDER_DATE&quot;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<p>ORDERS_DATE_IX は 3 段の木なので、索引はルート・ブランチ・葉の 3 ブロックで済んでいる。200 件分の項目が 1 枚の葉に収まったからである。ところが表は 200 ブロック（203 − 3）を読んでいる。</p>
+<h3 id="_3">同じ日付の行はどこにあるか</h3>
+<p>2024-03-01 の行が入っているブロックを調べる。</p>
+<pre><code class="language-sql">SELECT order_id, DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid) AS block_no
+FROM   orders
+WHERE  order_date = DATE '2024-03-01'
+ORDER  BY order_id
+FETCH  FIRST 5 ROWS ONLY;
+
+SELECT COUNT(DISTINCT DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid)) AS blocks, COUNT(*) AS cnt
+FROM   orders
+WHERE  order_date = DATE '2024-03-01';
+</code></pre>
+<pre><code class="language-text">  ORDER_ID   BLOCK_NO
+---------- ----------
+       425        140
+      1425        155
+      2425        152
+      3425        170
+      4425        178
+
+    BLOCKS        CNT
+---------- ----------
+       200        200
+</code></pre>
+<p>200 件が 200 個の別々のブロックに入っている。</p>
+<ul>
+<li>日付は <code>DATE '2023-01-01' + MOD(受注番号, 1000)</code> で作ったので、同じ日付は<strong>受注番号 1000 番おき</strong>に現れる</li>
+<li>受注は番号順に 1 ブロック約 200 行ずつ入っているので、1000 番離れた行は必ず別のブロックにある</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>手順</th>
+<th>読んだブロック</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引で 200 件の ROWID を調べる</td>
+<td>3</td>
+</tr>
+<tr>
+<td>ROWID ごとに表のブロックを読む（1 件 = 1 ブロック）</td>
+<td>200</td>
+</tr>
+<tr>
+<td>合計</td>
+<td>203</td>
+</tr>
+</tbody>
+</table>
+<p>200 件が 1 ブロックにまとまっていれば、3 + 1 = 4 ブロックで済んだ。同じ件数でも、行の置かれ方で約 50 倍の差がつく。</p>
+<p>ブロック番号が 140 → 155 → 152 と単調に増えないのは、Oracle が表の領域をある程度まとまった単位で確保して割り当てるためである。</p>
+<p>この「索引の順にたどると、1 行ごとに別のブロックへ移る」状態は、後述の CLUSTERING_FACTOR では ORDERS_DATE_IX の値 200,000（行数と同じ）として現れる。</p>
+<h3 id="_4">連続する受注番号はまとまっている</h3>
+<p>同じ 200 件でも、受注番号 12345〜12544 を取ると結果が変わる。</p>
+<pre><code class="language-sql">SELECT COUNT(DISTINCT DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid)) AS blocks, COUNT(*) AS cnt
+FROM   orders
+WHERE  order_id BETWEEN 12345 AND 12544;
+
+SELECT /*+ GATHER_PLAN_STATISTICS INDEX(orders) */ SUM(amount)
+FROM   orders
+WHERE  order_id BETWEEN 12345 AND 12544;
+</code></pre>
+<pre><code class="language-text">    BLOCKS        CNT
+---------- ----------
+         2        200
+</code></pre>
+<pre><code class="language-text">Plan hash value: 1688172886
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |             |      1 |        |      1 |00:00:00.01 |       5 |
+|   1 |  SORT AGGREGATE                      |             |      1 |      1 |      1 |00:00:00.01 |       5 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS      |      1 |    201 |    200 |00:00:00.01 |       5 |
+|*  3 |    INDEX RANGE SCAN                  | SYS_C008729 |      1 |    201 |    200 |00:00:00.01 |       3 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(&quot;ORDER_ID&quot;&gt;=12345 AND &quot;ORDER_ID&quot;&lt;=12544)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>200 件が入っているブロック</th>
+<th>合計 Buffers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>日付 = 2024-03-01</td>
+<td>200</td>
+<td>203</td>
+</tr>
+<tr>
+<td>受注番号 12345〜12544</td>
+<td>2</td>
+<td>5</td>
+</tr>
+</tbody>
+</table>
+<p>表は 5 − 3 = 2 ブロックしか読んでいない。</p>
+<p>違いを生むのは<strong>値が連続しているかどうかではなく、INSERT した順番</strong>である。表のブロックには、行が INSERT した順に、空きのある場所から入る。</p>
+<pre><code class="language-text">INSERT 順 →
+受注番号:  …  424    425    426  …  1424   1425   1426  …  2425 …
+日付:      …  2/29   3/1    3/2  …  2/29   3/1    3/2   …  3/1  …
+                     ↑                     ↑                ↑
+                 3/1 は 1000 件に 1 回しか INSERT されない
+
+ブロック A: 受注 401〜600   → 日付はすべて違う 200 日分（3/1 は 425 の 1 件だけ）
+ブロック B: 受注 601〜800   → 3/1 は 0 件
+  …
+ブロック F: 受注 1401〜1600 → 3/1 は 1425 の 1 件だけ
+</code></pre>
+<p>ブロックの区切りは説明用である。1 ブロックには連続して INSERT された約 200 件が入るので、次のようになる。</p>
+<ul>
+<li><strong>受注番号</strong>は INSERT の順番と同じ順に増えるので、連続する番号は同じブロックにまとまる</li>
+<li><strong>日付</strong>は 1 件ごとに次の日へ進んで循環するので、1 ブロックの 200 件はすべて違う日付になる。同じ日付の行は 200 個のブロックに散らばる</li>
+</ul>
+<p>これが CLUSTERING_FACTOR の差として現れる。主キー索引は 960（表のブロック数 1000 とほぼ同じ）、ORDERS_DATE_IX は 200,000（行数と同じ）である。</p>
+<div class="admonition note">
+<p class="admonition-title">まとまるかどうかは INSERT の順番で決まる</p>
+<p>INSERT の順番と値の順番が一致する列（連番の ID、登録日時など）では、行がまとまる。
+一致しない列では、連続する値でも行が散らばる。同じ値が続けて INSERT されれば 1 か所に集まり、間をあけて INSERT されれば散らばる。</p>
+</div>
+<h2 id="_5">散らばった行を索引で取る損益分岐点</h2>
+<p>行が散らばっていても、取る件数が少なければ索引のほうが得である。日付の範囲を広げながら、索引と FULL の Buffers を比べる。スクリプトは <code>sql/ch04_breakeven.sql</code> にある。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS INDEX(orders orders_date_ix) */ SUM(amount)   -- 索引を強制
+FROM   orders
+WHERE  order_date BETWEEN DATE '2024-03-01' AND DATE '2024-03-01' + 日数 - 1;
+-- 同じ SQL を FULL(orders) ヒント版と、ヒントなし版でも実行する
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>日数</th>
+<th>件数</th>
+<th>索引の Buffers</th>
+<th>FULL の Buffers</th>
+<th>オプティマイザが選んだ方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>200</td>
+<td>203</td>
+<td>1004</td>
+<td>索引</td>
+</tr>
+<tr>
+<td>3</td>
+<td>600</td>
+<td>605</td>
+<td>1004</td>
+<td>FULL</td>
+</tr>
+<tr>
+<td>5</td>
+<td>1,000</td>
+<td>1006</td>
+<td>1004</td>
+<td>FULL</td>
+</tr>
+<tr>
+<td>10</td>
+<td>2,000</td>
+<td>2008</td>
+<td>1004</td>
+<td>FULL</td>
+</tr>
+<tr>
+<td>30</td>
+<td>6,000</td>
+<td>6019</td>
+<td>1004</td>
+<td>FULL</td>
+</tr>
+</tbody>
+</table>
+<p>1 日分と 30 日分の索引版の計画を示す。</p>
+<pre><code class="language-text">1 日分（索引）
+Plan hash value: 118649109
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |      1 |00:00:00.01 |     203 |
+|   1 |  SORT AGGREGATE                      |                |      1 |      1 |      1 |00:00:00.01 |     203 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS         |      1 |    200 |    200 |00:00:00.01 |     203 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_IX |      1 |    200 |    200 |00:00:00.01 |       3 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(&quot;ORDER_DATE&quot;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<pre><code class="language-text">30 日分（索引）
+Plan hash value: 118649109
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |      1 |00:00:00.01 |    6019 |
+|   1 |  SORT AGGREGATE                      |                |      1 |      1 |      1 |00:00:00.01 |    6019 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS         |      1 |   6206 |   6000 |00:00:00.01 |    6019 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_IX |      1 |   6206 |   6000 |00:00:00.01 |      19 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;ORDER_DATE&quot;&lt;=TO_DATE(' 2024-03-30 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<p>1 日分の条件は <code>BETWEEN 同じ日 AND 同じ日</code> なので、オプティマイザが等価条件（<code>=</code>）に書き換えている。</p>
+<p>読み取れることは次のとおり。</p>
+<ul>
+<li><strong>索引の Buffers は件数にほぼ比例する。</strong> 行が 1 件ずつ別のブロックにあるので、1 件ごとに 1 ブロック読む</li>
+<li><strong>FULL の Buffers は件数によらず一定（1004）である。</strong> 何件取っても表を一度全部読むだけである</li>
+<li><strong>30 日分では、索引は表全体の約 6 倍を読む。</strong> 同じブロックを何度も読み直しているためである。表は 1000 ブロックしかないのに、6000 件分のブロックを 1 件ずつ取りに行っている</li>
+</ul>
+<h3 id="3-buffers-full">3 日分で、Buffers の少ない索引ではなく FULL が選ばれた理由</h3>
+<p>3 日分では、索引は 605、FULL は 1004 で、Buffers だけを見れば索引のほうが少ない。それでもオプティマイザは FULL を選んだ。</p>
+<p>理由は、1 回の読み込みで読めるブロック数が違うことにある。</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>読み込み方</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引から表を読む</td>
+<td>ROWID ごとに 1 ブロックずつ読む（シングルブロック読み込み）</td>
+</tr>
+<tr>
+<td>TABLE ACCESS FULL</td>
+<td>隣り合う複数のブロックを 1 回でまとめて読む（マルチブロック読み込み）</td>
+</tr>
+</tbody>
+</table>
+<p><code>Buffers</code> は、どちらの読み方でも 1 ブロックを 1 と数える。一方、オプティマイザの Cost（3 章）は、まとめて読めるぶん FULL を安く見積もる。そのため、Buffers では索引が少なくても、Cost では FULL が小さくなることがある。</p>
+<p>Buffers は「読んだブロックの量」の比較には便利だが、読み方の違いは表さない。境目に近いケースでは、Buffers の差がそのまま実行時間の差になるとは限らない。</p>
+<h2 id="range-scan">RANGE SCAN が有効かを判断する</h2>
+<p>判断の方法は 2 つある。実行した計画で確かめる方法と、実行前に見積もる方法である。</p>
+<h3 id="1">方法 1: 実行した計画で確かめる</h3>
+<p><code>ALLSTATS LAST</code> で計画を取り、次の 3 点を見る。</p>
+<p><strong>① 表アクセスの Buffers を、表全体のブロック数と比べる</strong></p>
+<p><code>TABLE ACCESS BY INDEX ROWID</code> の自分の Buffers（自分の値 − 索引の値）が、表のブロック数（<code>USER_TABLES.BLOCKS</code>）に近い、または超えているなら、索引の効果はない。前の節の 30 日分（6019 ブロック、表は 1000 ブロック）がこれにあたる。</p>
+<p><strong>② 索引で見つけた行が、表で捨てられていないかを見る</strong></p>
+<p>索引の <code>A-Rows</code> と、その親の <code>TABLE ACCESS BY INDEX ROWID</code> の <code>A-Rows</code> を比べる。親の行に <code>filter</code> が付いていて、<code>A-Rows</code> が大きく減っている場合、索引で見つけた行の大半を、表を読んでから捨てている。</p>
+<pre><code class="language-sql">SELECT /*+ GATHER_PLAN_STATISTICS INDEX(orders orders_date_ix) */ SUM(amount) FROM orders
+WHERE order_date BETWEEN DATE '2024-03-01' AND DATE '2024-03-02' AND amount &gt; 49000;
+</code></pre>
+<pre><code class="language-text">Plan hash value: 118649109
+
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |      1 |00:00:00.01 |     404 |
+|   1 |  SORT AGGREGATE                      |                |      1 |      1 |      1 |00:00:00.01 |     404 |
+|*  2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS         |      1 |     18 |     16 |00:00:00.01 |     404 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_DATE_IX |      1 |    600 |    400 |00:00:00.01 |       4 |
+-----------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(&quot;AMOUNT&quot;&gt;49000)
+   3 - access(&quot;ORDER_DATE&quot;&gt;=TO_DATE(' 2024-03-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              &quot;ORDER_DATE&quot;&lt;=TO_DATE(' 2024-03-02 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>段階</th>
+<th>行数</th>
+<th>読んだブロック</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引で日付の条件に合う行を見つける（Id 3）</td>
+<td>400</td>
+<td>4</td>
+</tr>
+<tr>
+<td>表を読み、<code>amount &gt; 49000</code> で絞る（Id 2）</td>
+<td>16</td>
+<td>400</td>
+</tr>
+</tbody>
+</table>
+<p>表を 400 ブロック読んだが、残ったのは 16 行である。384 行は、読んでから捨てている。<code>amount</code> は索引に入っていないため、表を読むまで条件を確かめられない。</p>
+<p>この場合は、条件の列をすべて含む複合索引（例: <code>(order_date, amount)</code>）を作れば、索引の中で 16 行まで絞り込める。そうすれば、表を読むのは 16 行分で済む。複合索引の作り方と列の順番は、この章では扱わない。</p>
+<p><strong>③ FULL ヒントの計画と比べる</strong></p>
+<p>迷ったら、<code>FULL(表名)</code> ヒントを付けた計画も取り、Buffers と A-Time を並べて比べる。前の節の表は、この方法で作った。</p>
+<h3 id="2">方法 2: 実行前に見積もる</h3>
+<p>表を読むブロック数は、<code>CLUSTERING_FACTOR</code> からおおよそ見積もれる。</p>
+<pre><code class="language-text">表を読むブロック数 ≒ CLUSTERING_FACTOR × (取り出す行数 ÷ 表の行数)
+</code></pre>
+<p>これを表のブロック数（ここでは 1000）と比べる。オプティマイザも、ほぼ同じ考え方で索引の Cost を計算している。</p>
+<table>
+<thead>
+<tr>
+<th>例</th>
+<th>CLUSTERING_FACTOR</th>
+<th>取り出す行数</th>
+<th>見積り</th>
+<th>実測（表の分）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>日付 1 日</td>
+<td>200,000</td>
+<td>200</td>
+<td>200,000 × 200 / 200,000 = 200</td>
+<td>200（203 − 3）</td>
+</tr>
+<tr>
+<td>日付 3 日</td>
+<td>200,000</td>
+<td>600</td>
+<td>200,000 × 600 / 200,000 = 600</td>
+<td>600（605 − 5）</td>
+</tr>
+<tr>
+<td>受注番号 12345〜12544</td>
+<td>960</td>
+<td>200</td>
+<td>960 × 200 / 200,000 ≒ 1</td>
+<td>2（5 − 3）</td>
+</tr>
+</tbody>
+</table>
+<p>見積りが表のブロック数よりずっと小さければ、RANGE SCAN は有効である。表のブロック数に近づくなら、FULL を検討する。</p>
+<h2 id="table-access-full">TABLE ACCESS FULL — 表を全部読む</h2>
+<pre><code class="language-sql">SELECT COUNT(*) FROM orders WHERE amount &gt; 49000;
+</code></pre>
+<pre><code class="language-text">----------------------------------------------------------------------------
+| Id  | Operation          | Name   | Starts | E-Rows | A-Rows | Buffers |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |        |      1 |        |      1 |    1004 |
+|   1 |  SORT AGGREGATE    |        |      1 |      1 |      1 |    1004 |
+|*  2 |   TABLE ACCESS FULL| ORDERS |      1 |   5996 |   5996 |    1004 |
+----------------------------------------------------------------------------
+
+   2 - filter(&quot;AMOUNT&quot;&gt;49000)
+</code></pre>
+<ul>
+<li>使える索引がないとき、または表の大部分を読むときに選ばれる</li>
+<li>表の全ブロック（約 1000）を読む。複数のブロックをまとめて読むので、1 ブロックあたりの負担は索引より軽い</li>
+<li>条件は <code>filter</code> になる。すべての行を読んだあとで、条件に合わない行を捨てるという意味である。<code>access</code> のように、読む範囲を絞る条件ではない</li>
+</ul>
+<h2 id="index-fast-full-scan">INDEX FAST FULL SCAN — 索引を表の代わりに全部読む</h2>
+<pre><code class="language-sql">SELECT COUNT(DISTINCT customer_id) FROM orders;
+</code></pre>
+<pre><code class="language-text">---------------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name               | Starts | E-Rows | A-Rows | Buffers |  OMem |  1Mem | Used-Mem |
+---------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |                    |      1 |        |      1 |     425 |       |       |          |
+|   1 |  SORT AGGREGATE        |                    |      1 |      1 |      1 |     425 |       |       |          |
+|   2 |   VIEW                 | VM_NWVW_1          |      1 |  10000 |  10000 |     425 |       |       |          |
+|   3 |    HASH GROUP BY       |                    |      1 |  10000 |  10000 |     425 |  2170K|  2170K| 1711K (0)|
+|   4 |     INDEX FAST FULL SCAN| ORDERS_CUSTOMER_IX |      1 |   200K |   200K |     425 |       |       |          |
+---------------------------------------------------------------------------------------------------------------
+</code></pre>
+<ul>
+<li>必要な列がすべて索引にあり、しかも全件を読むときに選ばれる</li>
+<li>索引を、細長い小さな表とみなして全部読む。ブロックを物理的な並び順に読むので、<strong>索引の順序（キーの並び）は保証されない</strong></li>
+<li>表を FULL で読むと 1004 ブロックかかるが、索引なら 425 ブロックで済む</li>
+</ul>
+<p><code>VIEW VM_NWVW_1</code> は、<code>COUNT(DISTINCT ...)</code> を「GROUP BY してから数える」形に書き換えたときに、オプティマイザが内部で作ったビューである。このような書き換えは 7 章で扱う。</p>
+<h2 id="index-full-scan-minmax">INDEX FULL SCAN (MIN/MAX) — 索引の端だけを読む</h2>
+<pre><code class="language-sql">SELECT MAX(order_date) FROM orders;
+</code></pre>
+<pre><code class="language-text">-----------------------------------------------------------------------------------
+| Id  | Operation                  | Name           | Starts | E-Rows | A-Rows | Buffers |
+-----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |                |      1 |        |      1 |       3 |
+|   1 |  SORT AGGREGATE            |                |      1 |      1 |      1 |       3 |
+|   2 |   INDEX FULL SCAN (MIN/MAX)| ORDERS_DATE_IX |      1 |      1 |      1 |       3 |
+-----------------------------------------------------------------------------------
+</code></pre>
+<ul>
+<li>索引列の <code>MIN</code> や <code>MAX</code> だけを求めるときに選ばれる</li>
+<li>索引はキーの順に並んでいるので、最大値は右端の葉にある。根から右端までたどるだけなので、3 ブロックで済む</li>
+<li>操作名に <code>FULL</code> と付いているが、実際に読むのは端の部分だけである</li>
+</ul>
+<h2 id="table-access-by-index-rowid-batched">TABLE ACCESS BY INDEX ROWID BATCHED</h2>
+<p>次の節の計画に出てくる。索引から得た ROWID を 1 件ずつ使うのではなく、いくつかまとめて、<strong>ブロックの順に並べ替えてから</strong>表を読む最適化である。同じブロックを何度も読み直さずに済む。読み方は <code>TABLE ACCESS BY INDEX ROWID</code> と同じでよい。</p>
+<h2 id="_6">「索引のほうが速い」とは限らない</h2>
+<p><code>status</code> 列の索引を使った場合と使わなかった場合を比べる。</p>
+<pre><code class="language-sql">SELECT SUM(amount) FROM orders WHERE status = 'SHIPPED';                                      -- F1
+SELECT /*+ INDEX(orders orders_status_ix) */ SUM(amount) FROM orders WHERE status = 'SHIPPED'; -- F2
+SELECT SUM(amount) FROM orders WHERE status = 'PENDING';                                      -- G1
+SELECT /*+ INDEX(orders orders_status_ix) */ SUM(amount) FROM orders WHERE status = 'PENDING'; -- G2
+</code></pre>
+<p>F1: SHIPPED をオプティマイザに任せた場合</p>
+<pre><code class="language-text">----------------------------------------------------------------------------
+| Id  | Operation          | Name   | Starts | E-Rows | A-Rows | Buffers |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |        |      1 |        |      1 |    1004 |
+|   1 |  SORT AGGREGATE    |        |      1 |      1 |      1 |    1004 |
+|*  2 |   TABLE ACCESS FULL| ORDERS |      1 |  66667 |   196K |    1004 |
+----------------------------------------------------------------------------
+
+   2 - filter(&quot;STATUS&quot;='SHIPPED')
+</code></pre>
+<p>F2: SHIPPED を索引で読ませた場合</p>
+<pre><code class="language-text">---------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name             | Starts | E-Rows | A-Rows | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                  |      1 |        |      1 |    1483 |
+|   1 |  SORT AGGREGATE                      |                  |      1 |      1 |      1 |    1483 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS           |      1 |  66667 |   196K |    1483 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_STATUS_IX |      1 |  66667 |   196K |     523 |
+---------------------------------------------------------------------------------------------------
+
+   3 - access(&quot;STATUS&quot;='SHIPPED')
+</code></pre>
+<p>G1: PENDING をオプティマイザに任せた場合</p>
+<pre><code class="language-text">----------------------------------------------------------------------------
+| Id  | Operation          | Name   | Starts | E-Rows | A-Rows | Buffers |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |        |      1 |        |      1 |    1004 |
+|   1 |  SORT AGGREGATE    |        |      1 |      1 |      1 |    1004 |
+|*  2 |   TABLE ACCESS FULL| ORDERS |      1 |  66667 |   3000 |    1004 |
+----------------------------------------------------------------------------
+
+   2 - filter(&quot;STATUS&quot;='PENDING')
+</code></pre>
+<p>G2: PENDING を索引で読ませた場合</p>
+<pre><code class="language-text">---------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name             | Starts | E-Rows | A-Rows | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                  |      1 |        |      1 |     970 |
+|   1 |  SORT AGGREGATE                      |                  |      1 |      1 |      1 |     970 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| ORDERS           |      1 |  66667 |   3000 |     970 |
+|*  3 |    INDEX RANGE SCAN                  | ORDERS_STATUS_IX |      1 |  66667 |   3000 |      11 |
+---------------------------------------------------------------------------------------------------
+
+   3 - access(&quot;STATUS&quot;='PENDING')
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>取り出す行</th>
+<th>FULL の Buffers</th>
+<th>索引の Buffers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SHIPPED</td>
+<td>196,000（98%）</td>
+<td>1004</td>
+<td>1483</td>
+</tr>
+<tr>
+<td>PENDING</td>
+<td>3,000（1.5%）</td>
+<td>1004</td>
+<td>970</td>
+</tr>
+</tbody>
+</table>
+<h3 id="shipped">SHIPPED: ほとんどの行を取るなら索引は損</h3>
+<p>98% の行を取るなら、どのみち表のほぼ全ブロックを読むことになる。索引を使うと、その上に索引の 523 ブロックを読む分だけ損をする。</p>
+<h3 id="pending-15">PENDING: 1.5% しか取らないのに、ほとんど得をしない</h3>
+<p>取り出すのは 3000 行だけなのに、索引経由でも表を 959 ブロック（970 − 11）読んでいる。表全体（約 1000 ブロック）とほぼ同じである。</p>
+<p>原因は、<strong>PENDING の行が表全体に散らばっていること</strong>である。データを作るとき、200 行ごとに 3 行を PENDING にした（<code>sql/01_schema.sql</code>）。1 ブロックにはおよそ 200 行入るので、ほぼすべてのブロックに PENDING の行が含まれる。3000 行を拾い集めるには、結局ほぼ全ブロックを読む必要がある。</p>
+<p><strong>索引が効くかどうかは、読む行数だけでは決まらない。その行がどれだけ少ないブロックにまとまっているかも効く。</strong></p>
+<h3 id="clustering_factor">CLUSTERING_FACTOR — 行のまとまり具合の指標</h3>
+<p><code>USER_INDEXES.CLUSTERING_FACTOR</code> は、索引をキーの順にたどったとき、表のブロックが切り替わった回数である。</p>
+<pre><code class="language-sql">SELECT index_name, clustering_factor, num_rows, leaf_blocks
+FROM   user_indexes WHERE table_name = 'ORDERS' ORDER BY clustering_factor;
+</code></pre>
+<pre><code class="language-text">INDEX_NAME           CLUSTERING_FACTOR   NUM_ROWS LEAF_BLOCKS
+-------------------- ----------------- ---------- -----------
+SYS_C008729                        960     200000         374
+ORDERS_STATUS_IX                  2879     200000         531
+ORDERS_DATE_IX                  200000     200000         531
+ORDERS_CUSTOMER_IX              200000     200000         418
+</code></pre>
+<p>表のブロック数（1000）と行数（200,000）を目安にして読む。</p>
+<ul>
+<li><strong>ブロック数に近い</strong> → 索引の順に並べると行がまとまっている（主キー <code>SYS_C008729</code>: 960）。<code>order_id</code> の順に行を挿入したためである</li>
+<li><strong>行数に近い</strong> → 索引の順に 1 行進むたびに別のブロックへ飛ぶ（<code>ORDERS_DATE_IX</code> と <code>ORDERS_CUSTOMER_IX</code>: 200,000）。連続した受注は日付も顧客もばらばらなためである</li>
+<li><code>ORDERS_STATUS_IX</code> の 2879 は、ブロック数の約 3 倍である。値ごとに見ると、行は表の順に並んでいる。しかし 3 種類の値のそれぞれが、表全体にわたって散らばっている。そのため、値 1 つにつき表をほぼ一周する</li>
+</ul>
+<p>クラスタリング・ファクタはオプティマイザも Cost の計算に使う。値が行数に近い索引ほど、表を引く Cost が高く見積もられる。</p>
+<h3 id="e-rows-66667">E-Rows が 66667 になっている理由</h3>
+<p>F1〜G2 の E-Rows は、すべて 66667 である。1 章と同じで、<code>status</code> にヒストグラムがないため、オプティマイザは 3 種類の値が均等に分布していると仮定している（200,000 ÷ 3）。そのため、オプティマイザは SHIPPED（実際は 196,000 行）と PENDING（実際は 3,000 行）を区別できていない。これは 6 章で扱う。</p>
+<h2 id="_7">まとめ</h2>
+<ul>
+<li>アクセスパスは計画の葉に現れる。Buffers の大半は葉で発生する</li>
+<li><code>INDEX UNIQUE SCAN</code> は 1 行を、<code>INDEX RANGE SCAN</code> は範囲を引く。<code>TABLE ACCESS BY INDEX ROWID</code> で表の行を読む</li>
+<li><code>TABLE ACCESS FULL</code> の条件は <code>filter</code> で、全件を読んでから捨てる</li>
+<li>必要な列がすべて索引にあれば、表を読まずに済む（<code>INDEX RANGE SCAN</code> だけの計画、<code>INDEX FAST FULL SCAN</code>）</li>
+<li><code>INDEX FULL SCAN (MIN/MAX)</code> は、索引の端だけを読む</li>
+<li>索引が効くかどうかは、取り出す行の割合と、その行のまとまり具合（<code>CLUSTERING_FACTOR</code>）で決まる。行が散らばっていれば、少ない行数でも表のほぼ全ブロックを読むことになる</li>
+<li>行がまとまるかどうかは、INSERT の順番で決まる。INSERT の順番と値の順番が一致する列では行がまとまり、一致しない列では散らばる</li>
+<li>行が散らばっていると、索引の Buffers は取る件数に比例して増え、FULL は一定である。FULL はまとめて読めるので、Buffers が索引より多くても FULL が選ばれることがある</li>
+<li>RANGE SCAN が有効かどうかは、実測では「表アクセスの Buffers」と「索引の A-Rows と表アクセスの A-Rows の差」で判断する。実行前には、<code>CLUSTERING_FACTOR × 取り出す割合</code> を表のブロック数と比べて見積もる</li>
+</ul>
+</article>
+  </main>
+</div>
+
+<nav class="pager" aria-label="ほかの章へ"></nav>
+<footer class="site-footer">
+  <span>Oracle 実行計画の読み方 — 学習ノート</span>
+  <span>実行計画はすべて Oracle AI Database 26ai Free（23.26.3）で実測</span>
+</footer>
+<script src="../assets/nav.js"></script>
+</body>
+</html>
