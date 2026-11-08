@@ -546,20 +546,30 @@ td { color: var(--fg-soft); }
 .home .site-footer { margin-top: 160px; }
 
 /* ───── 図（インライン SVG）。色は上のトークンから取る ───── */
-.xp-figure { margin: 36px 0; overflow-x: auto; }
-.xp-figure svg { display: block; width: 100%; max-width: 760px; height: auto; font-family: var(--font); }
-.xp-figure figcaption { margin-top: 10px; font-size: 13px; color: var(--muted); }
-.xp-box     { fill: var(--code-bg); stroke: var(--muted); stroke-width: 1; }
-.xp-hot     { fill: var(--accent-weak); stroke: var(--accent); stroke-width: 2.2; }
-.xp-dashbox { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 5 4; }
-.xp-line    { stroke: var(--muted); stroke-width: 1.2; fill: none; }
-.xp-dash    { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
-.xp-path    { stroke: var(--accent); stroke-width: 2.6; fill: none; }
-.xp-text    { fill: var(--fg); font-size: 13px; }
-.xp-small   { fill: var(--muted); font-size: 11px; }
-.xp-mono    { fill: var(--fg); font-size: 12px; font-family: var(--mono); white-space: pre; }
-.xp-accent  { fill: var(--accent); font-size: 13px; font-weight: 700; }
-.xp-arrow   { fill: var(--muted); }
+.xp-figure { margin: 40px 0; }
+.xp-figure svg {
+  display: block; box-sizing: border-box; width: 100%; height: auto;
+  padding: clamp(16px, 3vw, 32px);
+  background: var(--bg-elev); border: 1px solid var(--line); border-radius: 16px;
+  font-family: var(--font);
+}
+.xp-figure figcaption { margin-top: 12px; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.xp-box     { fill: var(--bg); stroke: var(--line-strong); stroke-width: 1; }
+.xp-hot     { fill: var(--accent-weak); stroke: var(--accent); stroke-width: 1.5; }
+.xp-dashbox { fill: none; stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 4 4; }
+.xp-line    { stroke: var(--line-strong); stroke-width: 1; fill: none; }
+.xp-dash    { stroke: var(--line-strong); stroke-width: 1; fill: none; stroke-dasharray: 3 4; }
+.xp-path    { stroke: var(--accent); stroke-width: 2; fill: none; }
+.xp-text    { fill: var(--fg); font-size: 14px; font-weight: 500; }
+.xp-small   { fill: var(--muted); font-size: 12px; }
+.xp-mono    { fill: var(--fg-soft); font-size: 12.5px; font-family: var(--mono); white-space: pre; }
+.xp-accent  { fill: var(--accent); font-size: 14px; font-weight: 600; }
+.xp-label   { fill: var(--muted); font-size: 11px; letter-spacing: 0.12em; }
+.xp-num     { fill: var(--fg); font-size: 26px; font-weight: 300; font-family: var(--display); }
+.xp-num-hot { fill: var(--accent); font-size: 26px; font-weight: 300; font-family: var(--display); }
+.xp-bar     { fill: var(--line-strong); }
+.xp-bar-hot { fill: var(--accent); }
+.xp-arrow   { fill: var(--line-strong); }
 .xp-arrow-hot { fill: var(--accent); }
 
 /* ───── 画面幅に応じた調整 ───── */
